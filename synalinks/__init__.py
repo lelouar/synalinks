@@ -149,6 +149,7 @@ from synalinks.api import Input
 from synalinks.api import Lambda
 from synalinks.api import MultiDecision
 from synalinks.api import Not
+from synalinks.api import OAuthLanguageModel
 from synalinks.api import Tool
 from synalinks.api import EmbeddingModel
 from synalinks.api import EmbedKnowledge

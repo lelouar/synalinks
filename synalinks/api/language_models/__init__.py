@@ -9,3 +9,6 @@ from synalinks.src.modules.language_models import deserialize as deserialize
 from synalinks.src.modules.language_models import get as get
 from synalinks.src.modules.language_models import serialize as serialize
 from synalinks.src.modules.language_models.language_model import LanguageModel as LanguageModel
+from synalinks.src.modules.language_models.oauth_language_model import (
+    OAuthLanguageModel as OAuthLanguageModel,
+)

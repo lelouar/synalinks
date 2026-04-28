@@ -134,6 +134,9 @@ from synalinks.src.metrics.em_metrics import EmbeddingModelRewardsOperationalMet
 from synalinks.src.metrics.lm_metrics import LMOperationalMetric as LMOperationalMetric
 from synalinks.src.metrics.lm_metrics import LMOptimizersOperationalMetric as LMOptimizersOperationalMetric
 from synalinks.src.metrics.lm_metrics import LMRewardsOperationalMetric as LMRewardsOperationalMetric
+from synalinks.src.modules.language_models.oauth_language_model import (
+    OAuthLanguageModel as OAuthLanguageModel,
+)
 from synalinks.src.metrics.metric import Metric as Metric
 from synalinks.src.metrics.program_metrics import ProgramOperationalMetric as ProgramOperationalMetric
 from synalinks.src.modules.agents.cypher_agent import CypherAgent as CypherAgent

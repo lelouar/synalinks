@@ -1,3 +1,4 @@
+import copy
 import warnings
 
 import numpy as np
@@ -112,8 +113,6 @@ class EarlyStopping(Callback):
             self.monitor_op = np.greater
         else:
             metric_name = self.monitor.removeprefix("val_")
-            if metric_name == "reward":
-                self.monitor_op = np.greater
             if hasattr(self.program, "metrics"):
                 all_metrics = []
                 for m in self.program.metrics:
@@ -125,13 +124,14 @@ class EarlyStopping(Callback):
                         ),
                     ):
                         all_metrics.extend(m.metrics)
+                    else:
+                        all_metrics.append(m)
                 for m in all_metrics:
-                    if m.name == metric_name:
-                        if hasattr(m, "_direction"):
-                            if m._direction == "up":
-                                self.monitor_op = np.greater
-                            else:
-                                self.monitor_op = np.less
+                    if m.name == metric_name and getattr(m, "direction", None):
+                        if m.direction == "up":
+                            self.monitor_op = np.greater
+                        else:
+                            self.monitor_op = np.less
         if self.monitor_op is None:
             raise ValueError(
                 f"EarlyStopping callback received monitor={self.monitor} "
@@ -158,7 +158,7 @@ class EarlyStopping(Callback):
             self._set_monitor_op()
 
         current = self.get_monitor_value(logs)
-        if current >= self.stop_at:
+        if current is not None and current >= self.stop_at:
             self.program.stop_training = True
             return
         if current is None or epoch < self.start_from_epoch:
@@ -167,7 +167,7 @@ class EarlyStopping(Callback):
         if self.restore_best_variables and self.best_variables is None:
             # If best variables were never set,
             # then the current variables are the best.
-            self.best_variables = self.program.get_variables()
+            self.best_variables = self._snapshot_variables()
             self.best_epoch = epoch
 
         self.wait += 1
@@ -175,7 +175,7 @@ class EarlyStopping(Callback):
             self.best = current
             self.best_epoch = epoch
             if self.restore_best_variables:
-                self.best_variables = self.program.get_variables()
+                self.best_variables = self._snapshot_variables()
             # Only restart wait if we beat both the baseline and our previous
             # best.
             if self.baseline is None or self._is_improvement(current, self.baseline):
@@ -197,7 +197,21 @@ class EarlyStopping(Callback):
                     "the end of the best epoch: "
                     f"{self.best_epoch + 1}."
                 )
-            self.program.set_variables(self.best_variables)
+            self._restore_variables(self.best_variables)
+
+    def _snapshot_variables(self):
+        """Deep-copy the program's trainable variable values.
+
+        Returns a list aligned with `self.program.trainable_variables` so it
+        can be restored positionally later. Values are the variables' JSON
+        dicts, deep-copied so later in-place updates don't mutate the snapshot.
+        """
+        return [copy.deepcopy(v.get_json()) for v in self.program.trainable_variables]
+
+    def _restore_variables(self, snapshot):
+        """Assign a previously captured snapshot back onto the program."""
+        for variable, value in zip(self.program.trainable_variables, snapshot):
+            variable.assign(value)
 
     def get_monitor_value(self, logs):
         logs = logs or {}

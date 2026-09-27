@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from synalinks.src import testing
 from synalinks.src.backend.common.json_schema_utils import is_schema_equal
@@ -185,3 +185,64 @@ class CoreTest(testing.TestCase):
         self.assertTrue("foo" in foobar_instance)
         self.assertTrue("bar" in foobar_instance)
         self.assertFalse("baz" in foobar_instance)
+
+    def test_get_nested_entity_on_data_model_instance(self):
+        from typing import Literal
+
+        from synalinks.src.backend.pydantic.knowledge import Entity
+        from synalinks.src.backend.pydantic.knowledge import Relation
+
+        class Chunk(Entity):
+            label: Literal["Chunk"]
+            text: str
+
+        class Document(Entity):
+            label: Literal["Document"]
+            title: str
+
+        class IsPartOf(Relation):
+            label: Literal["IsPartOf"]
+            subj: Chunk
+            obj: Document
+
+        rel = IsPartOf(
+            subj=Chunk(label="Chunk", text="abc"),
+            label="IsPartOf",
+            obj=Document(label="Document", title="paper-1"),
+        )
+
+        subj = rel.get_nested_entity("subj")
+        obj = rel.get_nested_entity("obj")
+
+        self.assertIsNotNone(subj)
+        self.assertIsNotNone(obj)
+        self.assertEqual(subj.get_schema(), Chunk.get_schema())
+        self.assertEqual(obj.get_schema(), Document.get_schema())
+
+    def test_get_nested_entity_list_on_data_model_instance(self):
+        from typing import List
+        from typing import Literal
+
+        from synalinks.src.backend.pydantic.knowledge import Entity
+
+        class Chunk(Entity):
+            label: Literal["Chunk"]
+            text: str
+
+        class Bag(DataModel):
+            entities: List[Chunk]
+
+        bag = Bag(
+            entities=[
+                Chunk(label="Chunk", text="a"),
+                Chunk(label="Chunk", text="b"),
+            ]
+        )
+
+        items = bag.get_nested_entity_list("entities")
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].get_schema(), Chunk.get_schema())
+        self.assertEqual(
+            [i.get_json() for i in items],
+            [{"label": "Chunk", "text": "a"}, {"label": "Chunk", "text": "b"}],
+        )

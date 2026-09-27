@@ -1,13 +1,62 @@
 # Quickstart
 
 !!! info
-    You can use the [`llms.txt`](/synalinks/llms.txt) or [`llms-full.txt`](/synalinks/llms-full.txt) to feed your favorite LMs with Synalinks documentation. Or better, use [Synalinks Claude Skills](https://github.com/SynaLinks/synalinks-skills) with Claude Code to use Synalinks right away!
+    Want to use Synalinks with your own coding agent (Claude Code, Cursor, Copilot, etc.)? Add the Synalinks-specific skills from [`synalinks-skills`](https://github.com/SynaLinks/synalinks-skills) on GitHub to your agent; they teach it the framework conventions and give it the context it needs to build Synalinks programs right away.
 
 ## Install
 
+### Quickstart in 3s with `uv` (recommended)
+
+If you don't know `uv`, install it [here](https://docs.astral.sh/uv/getting-started/installation/).
+
+`synalinks init` scaffolds a ready-to-run project from a template: a script, a
+REST API, a full-stack app, an MCP server, or a self-improving training/agent
+harness. Start a new Synalinks project in 3 seconds:
+
 ```shell
-uv pip install synalinks
+uvx synalinks init
 ```
+
+See [Project Templates](Project Templates.md) for what each template gives you.
+
+---
+
+You can also add the library to an existing project:
+
+```shell
+uv add synalinks
+```
+
+## Set up a language model
+
+Every program below sends requests to a language model, so you need one reachable
+*before* you run any of the examples.
+
+The examples use a model served locally by [Ollama](https://ollama.com); it is free
+and needs no API key. Install Ollama, then pull the model once:
+
+```shell
+ollama pull mistral
+```
+
+Ollama serves the model in the background; keep it running while you execute a program.
+
+Prefer a hosted provider? Synalinks integrates Anthropic, Mistral, Groq, OpenAI and more.
+Set the matching API key and change the `model` string; the rest of the code stays the
+same:
+
+```python
+import os
+
+os.environ["ANTHROPIC_API_KEY"] = "your-api-key"
+
+language_model = synalinks.LanguageModel(
+    model="anthropic/claude-3-5-sonnet-latest",
+)
+```
+
+See the [Language Models API](Synalinks API/Language Models API.md) for the full list of
+supported providers and model strings.
 
 ## Programming your application: 4 ways
 
@@ -19,6 +68,7 @@ and finally, you create your program from inputs and outputs:
 ```python
 import synalinks
 import asyncio
+
 
 async def main():
     class Query(synalinks.DataModel):
@@ -51,8 +101,25 @@ async def main():
         description="Useful to answer in a step by step manner.",
     )
 
+    # Run the program and print the structured result.
+    result = await program(
+        Query(query="What is 2 + 2? Reason step by step."),
+    )
+    print(result.prettify_json())
+
+
 if __name__ == "__main__":
     asyncio.run(main())
+```
+
+Running this prints the structured output: both the model's reasoning and the typed
+`answer` field:
+
+```json
+{
+  "thinking": "Two plus two means adding 2 and 2 together, which gives 4.",
+  "answer": 4.0
+}
 ```
 
 ### Subclassing the `Program` class
@@ -64,6 +131,7 @@ In that case, you should define your modules in `__init__()` and implement the p
 ```python
 import synalinks
 import asyncio
+
 
 async def main():
     class Query(synalinks.DataModel):
@@ -81,7 +149,7 @@ async def main():
 
     class ChainOfThought(synalinks.Program):
         """Useful to answer in a step by step manner.
-        
+
         The first line of the docstring is provided as description
         for the program if not provided in the `super().__init__()`.
         In a similar way the name is automatically infered based on
@@ -100,10 +168,12 @@ async def main():
                 description=description,
                 trainable=trainable,
             )
+            # Keep a reference so get_config() below can serialize it.
+            self.language_model = language_model
             self.answer = synalinks.Generator(
                 data_model=AnswerWithThinking,
                 language_model=language_model,
-                name="generator_"+self.name,
+                name="generator_" + self.name,
             )
 
         async def call(self, inputs, training=False):
@@ -118,8 +188,7 @@ async def main():
                 "description": self.description,
                 "trainable": self.trainable,
             }
-            language_model_config = \
-            {
+            language_model_config = {
                 "language_model": synalinks.saving.serialize_synalinks_object(
                     self.language_model
                 )
@@ -137,6 +206,7 @@ async def main():
 
     program = ChainOfThought(language_model=language_model)
 
+
 if __name__ == "__main__":
     asyncio.run(main())
 ```
@@ -150,6 +220,7 @@ In that case, you should implement only the `__init__()` and `build()` methods.
 ```python
 import synalinks
 import asyncio
+
 
 async def main():
 
@@ -183,7 +254,7 @@ async def main():
             )
 
             self.language_model = language_model
-        
+
         async def build(self, inputs):
             outputs = await synalinks.Generator(
                 data_model=AnswerWithThinking,
@@ -207,6 +278,7 @@ async def main():
         language_model=language_model,
     )
 
+
 if __name__ == "__main__":
     asyncio.run(main())
 ```
@@ -222,6 +294,7 @@ is purely a stack of single-input, single-output modules.
 ```python
 import synalinks
 import asyncio
+
 
 async def main():
     class Query(synalinks.DataModel):
@@ -254,6 +327,7 @@ async def main():
         name="chain_of_thought",
         description="Useful to answer in a step by step manner.",
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -290,6 +364,10 @@ result = await program(
 )
 ```
 
+`await` only works inside an `async` function (or a notebook cell). In a script, call it
+from your `async def main()` and launch it with `asyncio.run(main())`, exactly like the
+Functional API example above.
+
 ## Training your program
 
 ```python
@@ -301,11 +379,11 @@ async def main():
 
     program.compile(
         reward=synalinks.rewards.ExactMatch(in_mask=["answer"]),
-        optimizer=synalinks.optimizers.RandomFewShot()
+        optimizer=synalinks.optimizers.RandomFewShot(),
     )
 
-    batch_size=32
-    epochs=10
+    batch_size = 32
+    epochs = 10
 
     history = await program.fit(
         x_train,
@@ -316,6 +394,7 @@ async def main():
     )
 
     synalinks.utils.plot_history(history)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

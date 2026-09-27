@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.rewards.reward_wrappers import RewardFunctionWrapper
@@ -20,7 +20,7 @@ async def exact_match(y_true, y_pred):
             and 0.0 otherwise.
     """
     reward = 0.0
-    if y_pred is not None:
+    if y_pred is not None and y_true is not None:
         if y_pred.get_json() == y_true.get_json():
             reward = 1.0
     return reward
@@ -48,6 +48,10 @@ class ExactMatch(RewardFunctionWrapper):
         name (str): Optional. string name of the reward instance.
         in_mask (list): Optional. list of keys to keep to compute the reward.
         out_mask (list): Optional. list of keys to remove to compute the reward.
+        in_mask_pattern (str): Optional. Regex pattern; fields whose names match
+            are kept (combined with ``in_mask`` via OR).
+        out_mask_pattern (str): Optional. Regex pattern; fields whose names match
+            are dropped (combined with ``out_mask`` via OR).
     """
 
     def __init__(
@@ -55,12 +59,16 @@ class ExactMatch(RewardFunctionWrapper):
         name="exact_match",
         in_mask=None,
         out_mask=None,
+        in_mask_pattern=None,
+        out_mask_pattern=None,
     ):
         super().__init__(
             fn=exact_match,
             name=name,
             in_mask=in_mask,
             out_mask=out_mask,
+            in_mask_pattern=in_mask_pattern,
+            out_mask_pattern=out_mask_pattern,
         )
 
     def get_config(self):
@@ -68,6 +76,8 @@ class ExactMatch(RewardFunctionWrapper):
             "name": self.name,
             "in_mask": self.in_mask,
             "out_mask": self.out_mask,
+            "in_mask_pattern": self.in_mask_pattern,
+            "out_mask_pattern": self.out_mask_pattern,
         }
 
     @classmethod

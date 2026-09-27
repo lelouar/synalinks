@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.modules.module import Module
@@ -44,4 +44,8 @@ class Xor(Module):
                     output = inputs[i]
                 else:
                     return None
+        # All inputs were None (the `None ^ None -> None` row of the table):
+        # there is nothing to clone.
+        if output is None:
+            return None
         return output.clone(name=self.name)

@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import copy
 import inspect
@@ -339,21 +339,6 @@ class JsonDataModel:
             ops.Factorize().call(self),
         )
 
-    def decompose(self):
-        """Decomposes the data model.
-
-        This is the inverse of factorize. It expands list properties
-        into individual properties with numerical suffixes.
-
-        Returns:
-            (JsonDataModel): The decomposed data model.
-        """
-        from synalinks.src import ops
-
-        return run_maybe_nested(
-            ops.Decompose().call(self),
-        )
-
     def in_mask(self, mask=None, pattern=None, recursive=True):
         """Applies a mask to **keep only** specified keys of the data model.
 
@@ -369,9 +354,7 @@ class JsonDataModel:
         from synalinks.src import ops
 
         return run_maybe_nested(
-            ops.InMask(
-                mask=mask, pattern=pattern, recursive=recursive
-            ).call(self),
+            ops.InMask(mask=mask, pattern=pattern, recursive=recursive).call(self),
         )
 
     def out_mask(self, mask=None, pattern=None, recursive=True):
@@ -389,9 +372,7 @@ class JsonDataModel:
         from synalinks.src import ops
 
         return run_maybe_nested(
-            ops.OutMask(
-                mask=mask, pattern=pattern, recursive=recursive
-            ).call(self),
+            ops.OutMask(mask=mask, pattern=pattern, recursive=recursive).call(self),
         )
 
     def __invert__(self):
@@ -485,6 +466,113 @@ class JsonDataModel:
         else:
             clone.name = auto_name("clone_" + self.name)
         return clone
+
+    @staticmethod
+    def _resolve_ref_schema(spec, defs):
+        """Resolve a property/items spec to its target schema in ``defs``.
+
+        Handles a direct ``$ref`` and an ``anyOf`` / ``oneOf`` union with a
+        single ``$ref`` variant (the common "Optional[X]" / single-type
+        list shapes). Returns ``None`` when the spec doesn't point at a
+        single resolvable def; callers fall back to skipping the item.
+        """
+        if not isinstance(spec, dict):
+            return None
+        ref = spec.get("$ref")
+        if not ref:
+            for union_key in ("anyOf", "oneOf"):
+                variants = [v for v in spec.get(union_key, []) if v.get("$ref")]
+                if len(variants) == 1:
+                    ref = variants[0]["$ref"]
+                    break
+        if not ref:
+            return None
+        return copy.deepcopy(defs.get(ref.rsplit("/", 1)[-1]))
+
+    def _attach_nested_defs(self, schema, defs):
+        """Attach the subset of ``defs`` that ``schema`` references."""
+        nested_defs = {}
+        for obj_key, obj_schema in copy.deepcopy(defs).items():
+            if str(schema).find(f"#/$defs/{obj_key}") > 0:
+                nested_defs[obj_key] = obj_schema
+        if nested_defs:
+            schema.update({"$defs": nested_defs})
+        return schema
+
+    def get_nested_entity(self, key):
+        """Retrieve a nested Entity and convert it to a JsonDataModel.
+
+        The entity's `label` field is used as the discriminator to look up
+        its schema in the parent's `$defs`. When the label value isn't a
+        `$defs` key (the free-form case, where `label` is open data rather
+        than a `Literal` matching the class name), the field's *declared*
+        schema (its `$ref`) is used as a fallback. Returns ``None`` when the
+        value at ``key`` has no ``label`` or when no schema resolves.
+
+        Args:
+            key (str): The field name holding the nested entity.
+
+        Returns:
+            (JsonDataModel | None): A typed JsonDataModel wrapping the
+                nested entity, or ``None`` if the value isn't an entity.
+        """
+        json = copy.deepcopy(self.get(key))
+        if not json or "label" not in json:
+            return None
+        parent_schema = self.get_schema()
+        defs = parent_schema.get("$defs") or {}
+        schema = copy.deepcopy(defs.get(json.get("label")))
+        if not schema:
+            # Free-form: fall back to the field's declared type.
+            field_spec = (parent_schema.get("properties") or {}).get(key)
+            schema = self._resolve_ref_schema(field_spec, defs)
+        if not schema:
+            return None
+
+        schema = self._attach_nested_defs(schema, defs)
+        return JsonDataModel(json=json, schema=schema, name=key + "_" + self.name)
+
+    def get_nested_entity_list(self, key):
+        """Retrieve a nested Entity list and convert it to typed JsonDataModels.
+
+        Each item is resolved against the parent's `$defs` using its
+        ``label`` field as discriminator. When the label value isn't a
+        `$defs` key (the free-form case, where `label` is open data rather
+        than a `Literal` matching the class name), the list's *declared*
+        item schema (`items.$ref`) is used as a fallback. Items without a
+        ``label`` field or with no resolvable schema are skipped.
+
+        Args:
+            key (str): The field name holding the list of nested entities.
+
+        Returns:
+            (list[JsonDataModel]): One JsonDataModel per resolved entity.
+        """
+        items = self.get(key) or []
+        outputs = []
+        parent_schema = self.get_schema()
+        defs = parent_schema.get("$defs") or {}
+        # Declared item schema for this list field, resolved once and reused
+        # as the fallback for free-form labels that aren't $defs keys.
+        field_spec = (parent_schema.get("properties") or {}).get(key) or {}
+        field_item_schema = self._resolve_ref_schema(field_spec.get("items"), defs)
+        for i, item_json in enumerate(items):
+            if "label" not in item_json:
+                continue
+            schema = copy.deepcopy(defs.get(item_json.get("label")))
+            if not schema:
+                schema = copy.deepcopy(field_item_schema)
+            if not schema:
+                continue
+            schema = self._attach_nested_defs(schema, defs)
+            outputs.append(
+                JsonDataModel(
+                    json=item_json,
+                    schema=schema,
+                    name=key + f"_{i}_" + self.name,
+                )
+            )
+        return outputs
 
     def __repr__(self):
         return f"<JsonDataModel schema={self._schema}, json={self._json}>"

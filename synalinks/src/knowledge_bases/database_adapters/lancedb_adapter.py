@@ -1,0 +1,1328 @@
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
+"""LanceDB database adapter.
+
+LanceDB is a vector-native, embedded columnar store. This adapter mirrors the
+`DuckDBAdapter` contract (same public methods, same result shapes) on top
+of LanceDB:
+
+- vector similarity search is native (``table.search(vector)``),
+- full-text search uses LanceDB's Tantivy-backed FTS index,
+- ``hybrid_fts_search`` / ``hybrid_regex_search`` reuse the engine-agnostic RRF
+  fusion (they just call the single-signal search methods),
+- ``regex_search`` scans the column(s) and filters with Python ``re`` (RE2-free
+  but correct),
+- ``sql()`` is delegated to **DuckDB**, which scans the Lance datasets in place
+  (LanceDB has no SQL engine of its own).
+
+LanceDB has no primary-key constraint, so upserts are done with
+``merge_insert(on=<pk>)`` keyed off the first declared field, the same
+"primary key = first field" convention the DuckDB adapter uses. The original
+JSON schema is stashed in the Arrow schema metadata so reflection round-trips
+losslessly (object/array-typed columns are stored as JSON strings).
+"""
+
+import os
+import re
+import warnings
+from typing import Any
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Union
+
+import orjson
+import pyarrow as pa
+
+from synalinks.src.backend import EmbeddingRequest
+from synalinks.src.backend import JsonDataModel
+from synalinks.src.backend import SymbolicDataModel
+from synalinks.src.knowledge_bases.adapters_utils import format_search_results
+from synalinks.src.knowledge_bases.adapters_utils import minmax_normalize_scores
+from synalinks.src.knowledge_bases.adapters_utils import normalize_query_vectors
+from synalinks.src.knowledge_bases.adapters_utils import resolve_db_path
+from synalinks.src.knowledge_bases.adapters_utils import to_pascal_identifier
+from synalinks.src.knowledge_bases.adapters_utils import to_snake_identifier
+from synalinks.src.knowledge_bases.database_adapters.database_adapter import (
+    DatabaseAdapter,
+)
+from synalinks.src.modules.embedding_models import get as _get_em
+
+VSS_KEY = "embedding"
+# Canonical metric vocabulary, shared with ``DuckDBAdapter`` so the two adapters
+# stay drop-in compatible. ``_NATIVE_METRIC`` maps each canonical name to the
+# string LanceDB's ``Query.metric()`` actually expects.
+METRICS = ["l2sq", "cosine", "ip"]
+_NATIVE_METRIC = {"l2sq": "l2", "cosine": "cosine", "ip": "dot"}
+# Additive shift turning LanceDB's raw ``_distance`` into the canonical score
+# shared with DuckDB. LanceDB's "dot" distance is ``1 - <a,b>`` while the
+# canonical "ip" score is ``-<a,b>``, so shift by -1. "l2sq" (squared L2) and
+# "cosine" already agree with DuckDB and need no shift.
+_SCORE_OFFSET = {"l2sq": 0.0, "cosine": 0.0, "ip": -1.0}
+_SCHEMA_META_KEY = b"synalinks_schema"
+_DATE_LIKE_FORMATS = frozenset({"date", "date-time", "time"})
+
+table_identifier = to_pascal_identifier
+
+
+def _column_identifier(name: str) -> str:
+    return to_snake_identifier(name)
+
+
+def _sql_literal(value: Any) -> str:
+    """Render a Python value as a SQL literal for a LanceDB/Lance filter."""
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _stem(path: str) -> str:
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+class LanceDBAdapter(DatabaseAdapter):
+    def __init__(
+        self,
+        uri=None,
+        embedding_model=None,
+        data_models=None,
+        metric="cosine",
+        vss_key=VSS_KEY,
+        vector_dim=None,
+        wipe_on_start=False,
+        name=None,
+        **kwargs,
+    ):
+        import lancedb
+
+        # ``lancedb://<path>`` -> ``<path>``; ``None`` -> ~/.synalinks/<name>.lance
+        self.uri = resolve_db_path(uri, scheme="lancedb", extension="lance", name=name)
+
+        self.embedding_model = _get_em(embedding_model)
+        # Vector dimension resolved lazily on the main loop at first write (see
+        # `_ensure_vector_dim`), never via a probe here. The old probe used
+        # `run_maybe_nested`, running the embedding on a transient thread-loop
+        # and binding litellm's process-global httpx client to a loop closed
+        # moments later, poisoning it for every later main-loop embedding
+        # ("Event loop is closed"). `vector_dim=` short-circuits.
+        self.vector_dim = vector_dim
+        # The fixed-size vector column needs the dimension up front, so when an
+        # embedding model is set without an explicit `vector_dim`, defer creating
+        # the declared tables until the first `update` (where the dim is learned
+        # on the main loop). Only this case is deferred.
+        self._defer_table_creation = bool(self.embedding_model and not vector_dim)
+
+        if metric not in METRICS:
+            raise ValueError(f"`metric` parameter should be one of {METRICS}")
+        self.metric = metric
+        self.vss_key = vss_key
+        self.name = name
+
+        self._db = lancedb.connect(self.uri)
+
+        if wipe_on_start:
+            self.wipe_database()
+
+        self.data_models: Dict[str, Any] = {}
+        if data_models:
+            for dm in data_models:
+                title = dm.get_schema().get("title")
+                if title is None:
+                    raise ValueError(
+                        "Each registered data model must carry a schema `title`; "
+                        "got a schema with no title."
+                    )
+                self.data_models[table_identifier(title)] = dm
+                if not self._defer_table_creation:
+                    self._maybe_create_table(dm)
+        else:
+            for dm in self.get_symbolic_data_models():
+                self.data_models[dm.get_schema().get("title")] = dm
+
+    # -- schema mapping --------------------------------------------------------
+
+    @staticmethod
+    def _resolve_ref(spec: dict, defs: dict) -> dict:
+        if isinstance(spec, dict) and "$ref" in spec:
+            key = spec["$ref"].rsplit("/", 1)[-1]
+            return dict(defs.get(key, {}))
+        return spec
+
+    def _get_id_key(self, schema: dict) -> str:
+        props = schema.get("properties") if isinstance(schema, dict) else None
+        if not props:
+            raise ValueError("Cannot determine primary key: schema has no `properties`.")
+        return _column_identifier(next(iter(props.keys())))
+
+    def _json_schema_to_arrow(self, json_schema: dict):
+        """Build a PyArrow schema + the set of JSON-encoded column names."""
+        props = json_schema.get("properties", {})
+        defs = json_schema.get("$defs", {})
+        fields = []
+        json_cols = set()
+        for raw_name, raw_spec in props.items():
+            name = _column_identifier(raw_name)
+            spec = self._resolve_ref(raw_spec, defs)
+            t = spec.get("type")
+            if name == self.vss_key:
+                if self.vector_dim:
+                    fields.append(pa.field(name, pa.list_(pa.float32(), self.vector_dim)))
+                else:
+                    fields.append(pa.field(name, pa.list_(pa.float32())))
+            elif t == "string":
+                fields.append(pa.field(name, pa.string()))
+            elif t == "number":
+                fields.append(pa.field(name, pa.float64()))
+            elif t == "integer":
+                fields.append(pa.field(name, pa.int64()))
+            elif t == "boolean":
+                fields.append(pa.field(name, pa.bool_()))
+            elif t == "array":
+                items = self._resolve_ref(spec.get("items", {}), defs)
+                it = items.get("type")
+                if it == "number":
+                    fields.append(pa.field(name, pa.list_(pa.float64())))
+                elif it == "integer":
+                    fields.append(pa.field(name, pa.list_(pa.int64())))
+                elif it == "boolean":
+                    fields.append(pa.field(name, pa.list_(pa.bool_())))
+                elif it == "object":
+                    fields.append(pa.field(name, pa.string()))
+                    json_cols.add(name)
+                else:
+                    fields.append(pa.field(name, pa.list_(pa.string())))
+            elif t == "object":
+                fields.append(pa.field(name, pa.string()))
+                json_cols.add(name)
+            else:
+                # enum / unknown -> string
+                fields.append(pa.field(name, pa.string()))
+        metadata = {_SCHEMA_META_KEY: orjson.dumps(json_schema)}
+        return pa.schema(fields, metadata=metadata), json_cols
+
+    def _table_json_schema(self, table_name: str, remove_embedding: bool = True) -> dict:
+        """Reflect a table back to a JSON schema (from stashed metadata)."""
+        table = table_identifier(table_name)
+        tbl = self._db.open_table(table)
+        arrow_schema = tbl.schema
+        meta = arrow_schema.metadata or {}
+        stored = meta.get(_SCHEMA_META_KEY)
+        if stored:
+            schema = orjson.loads(stored)
+            if remove_embedding:
+                schema = dict(schema)
+                schema["properties"] = {
+                    k: v
+                    for k, v in schema.get("properties", {}).items()
+                    if _column_identifier(k) != self.vss_key
+                }
+                schema["required"] = list(schema["properties"].keys())
+            return schema
+        return self._arrow_to_json_schema(table, arrow_schema, remove_embedding)
+
+    def _arrow_to_json_schema(self, table, arrow_schema, remove_embedding) -> dict:
+        props = {}
+        for field in arrow_schema:
+            name = field.name
+            if name == self.vss_key and remove_embedding:
+                continue
+            pt = field.type
+            if pa.types.is_string(pt) or pa.types.is_large_string(pt):
+                props[name] = {"title": name.title(), "type": "string"}
+            elif pa.types.is_floating(pt):
+                props[name] = {"title": name.title(), "type": "number"}
+            elif pa.types.is_integer(pt):
+                props[name] = {"title": name.title(), "type": "integer"}
+            elif pa.types.is_boolean(pt):
+                props[name] = {"title": name.title(), "type": "boolean"}
+            elif pa.types.is_list(pt) or pa.types.is_fixed_size_list(pt):
+                vt = pt.value_type
+                if pa.types.is_floating(vt):
+                    item = {"type": "number"}
+                elif pa.types.is_integer(vt):
+                    item = {"type": "integer"}
+                elif pa.types.is_boolean(vt):
+                    item = {"type": "boolean"}
+                else:
+                    item = {"type": "string"}
+                props[name] = {"title": name.title(), "type": "array", "items": item}
+            else:
+                props[name] = {"title": name.title(), "type": "string"}
+        return {
+            "title": table,
+            "type": "object",
+            "additionalProperties": False,
+            "required": list(props.keys()),
+            "properties": props,
+        }
+
+    def _json_columns(self, json_schema: dict) -> set:
+        props = json_schema.get("properties", {})
+        defs = json_schema.get("$defs", {})
+        cols = set()
+        for raw_name, raw_spec in props.items():
+            spec = self._resolve_ref(raw_spec, defs)
+            t = spec.get("type")
+            if t == "object":
+                cols.add(_column_identifier(raw_name))
+            elif t == "array":
+                items = self._resolve_ref(spec.get("items", {}), defs)
+                if items.get("type") == "object":
+                    cols.add(_column_identifier(raw_name))
+        return cols
+
+    def _string_columns(self, json_schema: dict, *, exclude_pk=False) -> List[str]:
+        id_key = self._get_id_key(json_schema)
+        out = []
+        defs = json_schema.get("$defs", {})
+        for raw_name, raw_spec in json_schema.get("properties", {}).items():
+            name = _column_identifier(raw_name)
+            if exclude_pk and name == id_key:
+                continue
+            spec = self._resolve_ref(raw_spec, defs)
+            if (
+                spec.get("type") == "string"
+                and spec.get("format") not in _DATE_LIKE_FORMATS
+            ):
+                out.append(name)
+        return out
+
+    # -- table lifecycle -------------------------------------------------------
+
+    def wipe_database(self):
+        """Drop every table in the database, clearing all data."""
+        for name in self._db.table_names():
+            self._db.drop_table(name, ignore_missing=True)
+
+    def get_symbolic_data_models(self) -> List[SymbolicDataModel]:
+        """Reflect every table in the database into a symbolic model.
+
+        Each table's JSON schema is recovered from the stashed Arrow
+        metadata (or rebuilt from the Arrow schema), with the embedding
+        column kept.
+
+        Returns:
+            List[SymbolicDataModel]: One ``SymbolicDataModel`` per table,
+                representing the current database schema.
+        """
+        models = []
+        for table_name in self._db.table_names():
+            schema = self._table_json_schema(table_name, remove_embedding=False)
+            models.append(SymbolicDataModel(schema=schema))
+        return models
+
+    def _maybe_create_table(self, data_model):
+        json_schema = data_model.get_schema()
+        table = table_identifier(json_schema["title"])
+        if table in self._db.table_names():
+            return
+        arrow_schema, _ = self._json_schema_to_arrow(json_schema)
+        self._db.create_table(table, schema=arrow_schema)
+
+    def _row_for_storage(self, json_data: dict, json_cols: set, arrow_schema) -> dict:
+        row = {}
+        for field in arrow_schema:
+            name = field.name
+            value = json_data.get(name)
+            if name in json_cols and value is not None and not isinstance(value, str):
+                value = orjson.dumps(value).decode()
+            row[name] = value
+        return row
+
+    def _decode_row(self, row: dict, json_cols: set, remove_embedding: bool) -> dict:
+        out = {}
+        for k, v in row.items():
+            if remove_embedding and k == self.vss_key:
+                continue
+            if k in json_cols and isinstance(v, str):
+                try:
+                    v = orjson.loads(v)
+                except orjson.JSONDecodeError:
+                    pass
+            out[k] = v
+        return out
+
+    # -- writes ----------------------------------------------------------------
+
+    async def _ensure_vector_dim(self, sample_vector=None):
+        """Resolve the embedding dimension lazily, on the current event loop.
+
+        Prefers the length of an embedding vector already in hand (records
+        arrive pre-embedded from ``EmbedKnowledge``), falling back to a probe
+        awaited on *this* loop only when the fixed-size vector column must be
+        built before any embedded record is available. Never uses
+        ``run_maybe_nested`` (a transient-loop call poisons litellm's client).
+        """
+        if self.vector_dim is not None or not self.embedding_model:
+            return
+        if sample_vector:
+            self.vector_dim = len(sample_vector)
+            return
+        probe = await self.embedding_model(EmbeddingRequest(texts=["text"]))
+        embeddings = probe.get("embeddings") if probe is not None else None
+        if not embeddings:
+            raise ValueError(
+                f"Embedding model {self.embedding_model} returned no embeddings "
+                "while resolving the vector dimension. This usually means the "
+                "model name is wrong or unavailable for your provider/API key. "
+                "Fix the embedding model, or pass an explicit `vector_dim=...`."
+            )
+        self.vector_dim = len(embeddings[0])
+
+    async def _query_vectors(self, text_or_texts, vector_or_vectors, *, what):
+        """Resolve query vectors from explicit vectors or by embedding text.
+
+        Search methods accept either a query text (embedded here) or a
+        pre-computed ``vector_or_vectors`` passed directly. When vectors
+        are supplied the embedding step (and the embedding model) are
+        skipped entirely; the vector dimension is learned from the first
+        vector if it isn't known yet. Returns a list of vectors, or
+        ``None`` when there is nothing to search for.
+
+        Args:
+            text_or_texts: Query text or list of texts to embed. Ignored
+                when ``vector_or_vectors`` is supplied.
+            vector_or_vectors: A pre-computed query vector or list of
+                vectors. Takes precedence over ``text_or_texts``.
+            what: Caller name, used in the "needs an embedding model"
+                error message.
+        """
+        provided = normalize_query_vectors(vector_or_vectors)
+        if provided is not None:
+            if self.vector_dim is None:
+                self.vector_dim = len(provided[0])
+            return provided
+        if not text_or_texts:
+            return None
+        if not self.embedding_model:
+            raise ValueError(
+                f"{what} requires an embedding model on the adapter, or pass "
+                f"`vector_or_vectors=` directly."
+            )
+        texts = [text_or_texts] if not isinstance(text_or_texts, list) else text_or_texts
+        result = await self.embedding_model(EmbeddingRequest(texts=texts))
+        vectors = result.get("embeddings") if result is not None else None
+        if vectors:
+            await self._ensure_vector_dim(vectors[0])
+        return vectors or None
+
+    async def update(
+        self,
+        data_model_or_data_models: Union[List[JsonDataModel], JsonDataModel],
+    ) -> Union[Any, List[Any]]:
+        """Upsert records, then rebuild per-column FTS indexes.
+
+        Records are bucketed by table and applied with LanceDB's
+        ``merge_insert`` keyed off the first declared field (the primary
+        key). Returns the primary key value(s).
+
+        Args:
+            data_model_or_data_models: A single ``JsonDataModel`` or a list
+                of ``JsonDataModel`` to insert or update.
+
+        Returns:
+            The primary key value(s) of the upserted records: a single
+            value for a single input, or a list aligned with the input.
+        """
+        return_single = not isinstance(data_model_or_data_models, list)
+        data_models = (
+            [data_model_or_data_models] if return_single else data_model_or_data_models
+        )
+
+        ids: List[Any] = []
+        buckets: Dict[str, Dict[str, Any]] = {}
+
+        for data_model in data_models:
+            if not isinstance(data_model, JsonDataModel):
+                data_model = data_model.to_json_data_model()
+            schema = data_model.get_schema()
+            table = table_identifier(schema["title"])
+            json_data = {
+                _column_identifier(k): v for k, v in data_model.get_json().items()
+            }
+            id_key = self._get_id_key(schema)
+            id_val = json_data.get(id_key)
+            if id_val is None:
+                raise ValueError(f"Primary key '{id_key}' is required but not provided")
+
+            if table not in buckets:
+                # Learn the dimension from this record's embedding (or an
+                # on-loop probe) before the fixed-size vector column is built.
+                await self._ensure_vector_dim(json_data.get(self.vss_key))
+                self._maybe_create_table(data_model)
+                arrow_schema, json_cols = self._json_schema_to_arrow(schema)
+                buckets[table] = {
+                    "id_key": id_key,
+                    "rows": [],
+                    "json_cols": json_cols,
+                    "arrow_schema": arrow_schema,
+                }
+            bucket = buckets[table]
+            bucket["rows"].append(
+                self._row_for_storage(
+                    json_data, bucket["json_cols"], bucket["arrow_schema"]
+                )
+            )
+            ids.append(id_val)
+
+        for table, bucket in buckets.items():
+            tbl = self._db.open_table(table)
+            (
+                tbl.merge_insert(bucket["id_key"])
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute(bucket["rows"])
+            )
+            schema = self._table_json_schema(table, remove_embedding=False)
+            # LanceDB FTS indexes are one-per-field, so build a separate
+            # inverted index per text column; ``fulltext_search`` then queries
+            # across all of them via ``query_type="fts"``.
+            for col in self._string_columns(schema, exclude_pk=True):
+                try:
+                    tbl.create_fts_index(col, replace=True)
+                except Exception as e:
+                    warnings.warn(
+                        f"FTS index rebuild failed for '{table}.{col}'; "
+                        f"fulltext_search results may be stale. ({e})"
+                    )
+
+        return ids[0] if return_single else ids
+
+    async def get(
+        self,
+        id_or_ids: Union[Any, List[Any]],
+        *,
+        table_name: str,
+        remove_embedding: bool = True,
+    ) -> Union[Optional[JsonDataModel], List[Optional[JsonDataModel]]]:
+        """Look up one or more records by primary key in a single table.
+
+        Args:
+            id_or_ids: A single primary key value, or a list of values.
+            table_name: Target table.
+            remove_embedding: Strip the embedding column from the returned
+                records. Defaults to ``True`` to keep results LM-friendly.
+
+        Returns:
+            For a scalar id: the matching ``JsonDataModel``, or ``None`` if
+            not found. For a list of ids: a list in the same order, with
+            ``None`` in the slots that didn't match.
+        """
+        return_single = not isinstance(id_or_ids, list)
+        ids = [id_or_ids] if return_single else list(id_or_ids)
+        if not ids:
+            return None if return_single else []
+
+        table = table_identifier(table_name)
+        schema = self._table_json_schema(table, remove_embedding=remove_embedding)
+        full_schema = self._table_json_schema(table, remove_embedding=False)
+        id_key = self._get_id_key(full_schema)
+        json_cols = self._json_columns(full_schema)
+
+        tbl = self._db.open_table(table)
+        predicate = f"{id_key} IN ({', '.join(_sql_literal(i) for i in ids)})"
+        try:
+            rows = tbl.search().where(predicate).to_arrow().to_pylist()
+        except Exception as e:
+            warnings.warn(f"get(): read from '{table}' failed. ({e})")
+            return None if return_single else [None] * len(ids)
+
+        results: List[Optional[JsonDataModel]] = [None] * len(ids)
+        rows_by_id = {row[id_key]: row for row in rows}
+        for idx, id_val in enumerate(ids):
+            row = rows_by_id.get(id_val)
+            if row is None:
+                continue
+            json_data = self._decode_row(row, json_cols, remove_embedding)
+            results[idx] = JsonDataModel(
+                json=json_data, schema=schema, name=str(json_data.get(id_key))
+            )
+        return results[0] if return_single else results
+
+    async def getall(
+        self,
+        *,
+        table_name: str,
+        limit: int = 50,
+        offset: int = 0,
+        remove_embedding: bool = True,
+    ) -> List[JsonDataModel]:
+        """List rows from a single table, paginated.
+
+        Returns an empty list (with a warning) if the table doesn't exist,
+        so callers can safely enumerate without pre-checking.
+
+        Args:
+            table_name: Target table.
+            limit: Maximum number of records to return.
+            offset: Number of records to skip.
+            remove_embedding: Strip the embedding column from results.
+
+        Returns:
+            A list of ``JsonDataModel`` records.
+        """
+        table = table_identifier(table_name)
+        if table not in self._db.table_names():
+            warnings.warn(f"Failed to read table '{table}': not found")
+            return []
+        schema = self._table_json_schema(table, remove_embedding=remove_embedding)
+        full_schema = self._table_json_schema(table, remove_embedding=False)
+        id_key = self._get_id_key(full_schema)
+        json_cols = self._json_columns(full_schema)
+
+        tbl = self._db.open_table(table)
+        try:
+            rows = tbl.search().limit(limit).offset(offset).to_arrow().to_pylist()
+        except Exception as e:
+            warnings.warn(f"Failed to read table '{table}': {e}")
+            return []
+
+        results = []
+        for row in rows:
+            json_data = self._decode_row(row, json_cols, remove_embedding)
+            results.append(
+                JsonDataModel(
+                    json=json_data, schema=schema, name=str(json_data.get(id_key))
+                )
+            )
+        return results
+
+    async def delete(
+        self,
+        id_or_ids: Union[Any, List[Any]],
+        *,
+        table_name: str,
+    ) -> int:
+        """Delete records by primary key from a single table.
+
+        Args:
+            id_or_ids: A single primary key value, or a list of values.
+            table_name: Target table.
+
+        Returns:
+            The number of rows actually deleted (0 if none matched or if
+            the table doesn't exist).
+        """
+        ids = [id_or_ids] if not isinstance(id_or_ids, list) else list(id_or_ids)
+        if not ids:
+            return 0
+        table = table_identifier(table_name)
+        if table not in self._db.table_names():
+            return 0
+        tbl = self._db.open_table(table)
+        full_schema = self._table_json_schema(table, remove_embedding=False)
+        id_key = self._get_id_key(full_schema)
+        before = tbl.count_rows()
+        predicate = f"{id_key} IN ({', '.join(_sql_literal(i) for i in ids)})"
+        tbl.delete(predicate)
+        return before - tbl.count_rows()
+
+    async def drop_table(self, table_name: str) -> bool:
+        """Drop a table and remove it from the known-tables registry.
+
+        Args:
+            table_name: Target table.
+
+        Returns:
+            ``True`` if a table was dropped, ``False`` if no such table
+            existed.
+        """
+        table = table_identifier(table_name)
+        if table not in self._db.table_names():
+            return False
+        self._db.drop_table(table)
+        self.data_models.pop(table, None)
+        return True
+
+    async def rename(
+        self,
+        source: Any,
+        *,
+        table_name: Optional[str] = None,
+        table_description: Optional[str] = None,
+    ) -> SymbolicDataModel:
+        """Rename a table and/or update its schema description.
+
+        Args:
+            source: ``SymbolicDataModel`` for the table to rename, or its
+                name as a string. Always normalized to PascalCase.
+            table_name: New table name. Optional; pass to rename the table.
+            table_description: New schema description. Optional.
+
+        Returns:
+            A ``SymbolicDataModel`` for the (possibly renamed) table,
+            reflecting its current column shape and the supplied
+            description.
+        """
+        old = table_identifier(
+            source.get_schema()["title"] if hasattr(source, "get_schema") else source
+        )
+        new = table_identifier(table_name) if table_name else old
+        if new != old:
+            self._db.rename_table(old, new)
+        schema = self._table_json_schema(new, remove_embedding=False)
+        schema["title"] = new
+        if table_description is not None:
+            schema["description"] = table_description
+        return SymbolicDataModel(schema=schema)
+
+    # -- bulk file loaders -----------------------------------------------------
+
+    async def _from_arrow(self, arrow_table, table_name, table_description):
+        table = table_identifier(table_name)
+        json_schema = self._arrow_to_json_schema(table, arrow_table.schema, False)
+        if table_description is not None:
+            json_schema["description"] = table_description
+        metadata = {_SCHEMA_META_KEY: orjson.dumps(json_schema)}
+        arrow_table = arrow_table.replace_schema_metadata(metadata)
+        self._db.drop_table(table, ignore_missing=True)
+        self._db.create_table(table, data=arrow_table)
+        return SymbolicDataModel(schema=json_schema)
+
+    async def from_csv(
+        self,
+        path: str,
+        *,
+        table_name: Optional[str] = None,
+        table_description: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SymbolicDataModel:
+        """Bulk-load a CSV file directly into a new (or existing) table.
+
+        Reads the file with PyArrow and creates the table from the file's
+        columns; the first column is the primary key.
+
+        Args:
+            path: Path to the CSV file.
+            table_name: Target table name. Defaults to the file's stem,
+                PascalCase-normalized.
+            table_description: Optional schema description.
+            **kwargs: Reserved for adapter-specific options.
+
+        Returns:
+            The ``SymbolicDataModel`` for the loaded table.
+        """
+        import pyarrow.csv as pa_csv
+
+        return await self._from_arrow(
+            pa_csv.read_csv(path), table_name or _stem(path), table_description
+        )
+
+    async def from_parquet(
+        self,
+        path: str,
+        *,
+        table_name: Optional[str] = None,
+        table_description: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SymbolicDataModel:
+        """Bulk-load a Parquet file directly into a new (or existing) table.
+
+        Reads the file with PyArrow and creates the table from the file's
+        columns; the first column is the primary key.
+
+        Args:
+            path: Path to the Parquet file.
+            table_name: Target table name. Defaults to the file's stem,
+                PascalCase-normalized.
+            table_description: Optional schema description.
+            **kwargs: Reserved for adapter-specific options.
+
+        Returns:
+            The ``SymbolicDataModel`` for the loaded table.
+        """
+        import pyarrow.parquet as pa_parquet
+
+        return await self._from_arrow(
+            pa_parquet.read_table(path), table_name or _stem(path), table_description
+        )
+
+    async def from_json(
+        self,
+        path: str,
+        *,
+        table_name: Optional[str] = None,
+        table_description: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SymbolicDataModel:
+        """Bulk-load a JSON file (top-level array of objects).
+
+        Args:
+            path: Path to the JSON file. Must contain a top-level array of
+                objects, e.g. ``[{"id": "a", "text": "..."}, ...]``.
+            table_name: Target table name. Defaults to the file's stem,
+                PascalCase-normalized.
+            table_description: Optional schema description.
+            **kwargs: Reserved for adapter-specific options.
+
+        Returns:
+            The ``SymbolicDataModel`` for the loaded table.
+        """
+        with open(path, "rb") as f:
+            records = orjson.loads(f.read())
+        return await self._from_arrow(
+            pa.Table.from_pylist(records), table_name or _stem(path), table_description
+        )
+
+    async def from_jsonl(
+        self,
+        path: str,
+        *,
+        table_name: Optional[str] = None,
+        table_description: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SymbolicDataModel:
+        """Bulk-load a JSON Lines (NDJSON) file.
+
+        Args:
+            path: Path to the JSONL file (one JSON object per line).
+            table_name: Target table name. Defaults to the file's stem,
+                PascalCase-normalized.
+            table_description: Optional schema description.
+            **kwargs: Reserved for adapter-specific options.
+
+        Returns:
+            The ``SymbolicDataModel`` for the loaded table.
+        """
+        records = []
+        with open(path, "rb") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(orjson.loads(line))
+        return await self._from_arrow(
+            pa.Table.from_pylist(records), table_name or _stem(path), table_description
+        )
+
+    # -- sql (delegated to DuckDB scanning the Lance datasets) -----------------
+
+    async def sql(
+        self,
+        sql: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        output_format: str = "json",
+        **kwargs,
+    ):
+        """Run SQL over the LanceDB tables via DuckDB.
+
+        LanceDB has no SQL engine; DuckDB scans each table (registered as an
+        Arrow view under its table name) so arbitrary read-only ``SELECT`` /
+        joins / aggregates work.
+        """
+        import duckdb
+
+        con = duckdb.connect(":memory:")
+        try:
+            for table in self._db.table_names():
+                con.register(table, self._db.open_table(table).to_arrow())
+            cursor = con.execute(sql, params) if params else con.execute(sql)
+            arrow_table = cursor.arrow().read_all()
+        finally:
+            con.close()
+        return format_search_results(arrow_table, output_format)
+
+    # -- search ----------------------------------------------------------------
+
+    async def similarity_search(
+        self,
+        text_or_texts: Optional[Union[str, List[str]]] = None,
+        *,
+        table_name: str,
+        vector_or_vectors: Optional[Union[List[float], List[List[float]]]] = None,
+        k: int = 10,
+        threshold: Optional[float] = None,
+        ef_search: Optional[int] = None,
+        output_format: str = "json",
+    ):
+        """Vector similarity search against a single table.
+
+        Multiple queries are merged into a single ranked result set
+        (best score per id kept).
+
+        Args:
+            text_or_texts: Query text, or list of query texts. Embedded
+                with the adapter's embedding model. Ignored when
+                ``vector_or_vectors`` is supplied.
+            table_name: Target table.
+            vector_or_vectors: A pre-computed query vector, or a list of
+                vectors, to search with directly instead of embedding
+                ``text_or_texts``. When supplied, no embedding model is
+                required on the adapter.
+            k: Maximum number of rows returned.
+            threshold: Optional maximum vector distance; rows beyond this
+                distance are dropped.
+            ef_search: Optional override for the HNSW search-time
+                candidate-list depth. Accepted for parity with the DuckDB
+                adapter.
+            output_format: ``"json"`` (list of dicts, default) or ``"csv"``
+                (CSV string).
+        """
+        vectors = await self._query_vectors(
+            text_or_texts, vector_or_vectors, what="similarity_search"
+        )
+        if not vectors:
+            return format_search_results([], output_format)
+        table = table_identifier(table_name)
+        full_schema = self._table_json_schema(table, remove_embedding=False)
+        id_key = self._get_id_key(full_schema)
+        json_cols = self._json_columns(full_schema)
+
+        offset = _SCORE_OFFSET[self.metric]
+        tbl = self._db.open_table(table)
+        merged: Dict[Any, Dict[str, Any]] = {}
+        for vector in vectors:
+            q = tbl.search(vector, vector_column_name=self.vss_key).metric(
+                _NATIVE_METRIC[self.metric]
+            )
+            rows = q.limit(k).to_arrow().to_pylist()
+            for row in rows:
+                dist = row.pop("_distance", None)
+                score = dist + offset if dist is not None else None
+                if threshold is not None and score is not None and not score < threshold:
+                    continue
+                row["score"] = score
+                row = self._decode_row(row, json_cols, remove_embedding=False)
+                uid = row[id_key]
+                prev = merged.get(uid)
+                if prev is None or row["score"] < prev["score"]:
+                    merged[uid] = row
+        ranked = sorted(merged.values(), key=lambda r: r["score"])[:k]
+        return format_search_results(ranked, output_format)
+
+    async def fulltext_search(
+        self,
+        text_or_texts: Union[str, List[str]],
+        *,
+        table_name: str,
+        k: int = 10,
+        threshold: Optional[float] = None,
+        output_format: str = "json",
+        **kwargs: Any,
+    ):
+        """Full-text search against a single table (Tantivy FTS).
+
+        Multiple queries are merged (best score per id kept). Raw Tantivy
+        scores are min-max rescaled to ``[0, 1]`` so they're comparable
+        with the DuckDB adapter.
+
+        Args:
+            text_or_texts: Query text, or list of query texts.
+            table_name: Target table.
+            k: Maximum number of rows returned.
+            threshold: Optional minimum relevance on the normalized
+                ``[0, 1]`` scale; filters on the same scale as ``score``.
+            output_format: ``"json"`` (list of dicts, default) or ``"csv"``
+                (CSV string).
+            **kwargs: Reserved for adapter-specific options.
+        """
+        if not text_or_texts:
+            return format_search_results([], output_format)
+        texts = [text_or_texts] if not isinstance(text_or_texts, list) else text_or_texts
+        table = table_identifier(table_name)
+        full_schema = self._table_json_schema(table, remove_embedding=False)
+        id_key = self._get_id_key(full_schema)
+        json_cols = self._json_columns(full_schema)
+        if not self._string_columns(full_schema, exclude_pk=True):
+            warnings.warn(f"Skipping FTS search for {table}: no text columns to index.")
+            return format_search_results([], output_format)
+
+        tbl = self._db.open_table(table)
+        merged: Dict[Any, Dict[str, Any]] = {}
+        for text in texts:
+            try:
+                rows = tbl.search(text, query_type="fts").limit(k).to_arrow().to_pylist()
+            except Exception as e:
+                raise RuntimeError(f"FTS query failed for table '{table}': {e}")
+            for row in rows:
+                row["score"] = row.pop("_score", None)
+                row = self._decode_row(row, json_cols, remove_embedding=False)
+                uid = row[id_key]
+                prev = merged.get(uid)
+                if prev is None or (row["score"] or 0) > (prev["score"] or 0):
+                    merged[uid] = row
+        ranked = sorted(merged.values(), key=lambda r: r["score"] or 0, reverse=True)[:k]
+        # Rescale raw Tantivy scores to [0, 1] so they're comparable with the
+        # DuckDB adapter; ``threshold`` filters on the same normalized scale.
+        minmax_normalize_scores(ranked, key="score")
+        if threshold is not None:
+            ranked = [r for r in ranked if r["score"] >= threshold]
+        return format_search_results(ranked, output_format)
+
+    async def regex_search(
+        self,
+        pattern: str,
+        *,
+        table_name: str,
+        fields: Optional[List[str]] = None,
+        case_sensitive: bool = True,
+        k: int = 10,
+        output_format: str = "json",
+    ):
+        """Find rows whose string fields match a regular expression.
+
+        Scans the column(s) and filters with Python's ``re`` module.
+
+        Args:
+            pattern: The regex pattern (Python ``re`` syntax).
+            table_name: Target table.
+            fields: Field names to match against. Defaults to every
+                string-typed field on the schema. Names not present as
+                string columns are silently dropped.
+            case_sensitive: When ``False``, matches case-insensitively.
+            k: Maximum number of rows returned.
+            output_format: ``"json"`` (list of dicts, default) or ``"csv"``
+                (CSV string).
+        """
+        if not pattern:
+            return format_search_results([], output_format)
+        table = table_identifier(table_name)
+        full_schema = self._table_json_schema(table, remove_embedding=False)
+        json_cols = self._json_columns(full_schema)
+        string_cols = self._string_columns(full_schema, exclude_pk=False)
+        if fields is not None:
+            requested = {_column_identifier(f) for f in fields}
+            cols = [c for c in string_cols if c in requested]
+        else:
+            cols = string_cols
+        if not cols:
+            warnings.warn(
+                f"Skipping regex search for {table}: no matching string fields."
+            )
+            return format_search_results([], output_format)
+
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            compiled = re.compile(pattern, flags)
+        except re.error as e:
+            raise RuntimeError(f"Invalid regex pattern for table '{table}': {e}")
+
+        tbl = self._db.open_table(table)
+        out = []
+        for row in tbl.to_arrow().to_pylist():
+            if any(isinstance(row.get(c), str) and compiled.search(row[c]) for c in cols):
+                out.append(self._decode_row(row, json_cols, remove_embedding=False))
+                if len(out) >= k:
+                    break
+        return format_search_results(out, output_format)
+
+    async def hybrid_search(self, *args, **kwargs):
+        """Deprecated alias of `hybrid_fts_search`.
+
+        Kept so call sites pre-dating the rename keep working. Prefer the
+        new name in new code; it's symmetric with `hybrid_regex_search`.
+        """
+        return await self.hybrid_fts_search(*args, **kwargs)
+
+    async def hybrid_fts_search(
+        self,
+        text_or_texts: Optional[Union[str, List[str]]] = None,
+        *,
+        keywords: Optional[Union[str, List[str]]] = None,
+        table_name: str,
+        vector_or_vectors: Optional[Union[List[float], List[List[float]]]] = None,
+        k: int = 10,
+        k_rank: int = 60,
+        similarity_threshold: Optional[float] = None,
+        fulltext_threshold: Optional[float] = None,
+        ef_search: Optional[int] = None,
+        output_format: str = "json",
+        **kwargs: Any,
+    ):
+        """Reciprocal-Rank-Fusion of vector similarity + fulltext.
+
+        Runs `similarity_search` and `fulltext_search` against the same
+        table, then fuses their rankings with the RRF formula
+        ``sum(1 / (k_rank + rank))``. Falls back to pure FTS when there
+        are no vectors to search with (no embedding model and no
+        ``vector_or_vectors``).
+
+        The vector branch can be driven by pre-computed vectors via
+        ``vector_or_vectors`` instead of ``text_or_texts``; when vectors
+        are supplied the fulltext branch runs only if ``keywords`` are
+        also supplied, and no embedding model is required.
+
+        Args:
+            text_or_texts: Query text or list of query texts for the vector
+                branch. Ignored when ``vector_or_vectors`` is supplied.
+            keywords: Query text or list for the fulltext branch. Aligns by
+                position with the vector-branch queries; when omitted, the
+                text is reused for both branches.
+            table_name: Target table.
+            vector_or_vectors: Pre-computed query vector(s) for the vector
+                branch, used directly instead of embedding ``text_or_texts``.
+            k: Maximum number of rows returned.
+            k_rank: RRF smoothing constant (default 60). Lower values weight
+                top-ranked rows more strongly.
+            similarity_threshold: Optional maximum vector distance.
+            fulltext_threshold: Optional minimum fulltext relevance on the
+                normalized ``[0, 1]`` scale.
+            ef_search: Forwarded to the vector branch (`similarity_search`).
+            output_format: ``"json"`` (list of dicts, default) or ``"csv"``
+                (CSV string).
+            **kwargs: Reserved for adapter-specific options.
+        """
+        provided_vectors = normalize_query_vectors(vector_or_vectors)
+        if not text_or_texts and provided_vectors is None and not keywords:
+            return format_search_results([], output_format)
+        table = table_identifier(table_name)
+        full_schema = self._table_json_schema(table, remove_embedding=False)
+        id_key = self._get_id_key(full_schema)
+
+        # The vector branch can run with explicit vectors, or with text
+        # plus a configured embedding model. Without either, degrade to
+        # a fulltext-only search.
+        can_vector = provided_vectors is not None or (
+            bool(text_or_texts) and bool(self.embedding_model)
+        )
+        if not can_vector:
+            fts_rows = await self.fulltext_search(
+                keywords if keywords is not None else text_or_texts,
+                table_name=table,
+                k=k,
+                threshold=fulltext_threshold,
+                output_format="json",
+            )
+            for row in fts_rows:
+                row.setdefault("rrf_score", row.get("score", 0.0))
+            return format_search_results(fts_rows, output_format)
+
+        # Build the per-slot vector-branch input (either pre-computed
+        # vectors or texts to embed), then align the keyword for each slot.
+        if provided_vectors is not None:
+            vec_texts: List[Optional[str]] = [None] * len(provided_vectors)
+            vec_vectors: List[Optional[List[float]]] = list(provided_vectors)
+        else:
+            vec_texts = (
+                [text_or_texts] if isinstance(text_or_texts, str) else list(text_or_texts)
+            )
+            vec_vectors = [None] * len(vec_texts)
+        n = len(vec_texts)
+
+        if keywords is not None:
+            keyword_queries: List[Optional[str]] = (
+                [keywords] if isinstance(keywords, str) else list(keywords)
+            )
+            if len(keyword_queries) != n:
+                raise ValueError(
+                    f"`keywords` must align with the vector-branch queries: "
+                    f"got {len(keyword_queries)} keyword(s) vs {n} quer(ies)."
+                )
+        elif provided_vectors is None:
+            keyword_queries = list(vec_texts)
+        else:
+            keyword_queries = [None] * n
+
+        final: Dict[Any, Dict[str, Any]] = {}
+        for query_text, query_vector, keyword_text in zip(
+            vec_texts, vec_vectors, keyword_queries
+        ):
+            if keyword_text is not None:
+                try:
+                    fts_results = await self.fulltext_search(
+                        keyword_text,
+                        table_name=table,
+                        k=k * 5,
+                        threshold=fulltext_threshold,
+                        output_format="json",
+                    )
+                except Exception:
+                    fts_results = []
+            else:
+                fts_results = []
+            try:
+                vss_results = await self.similarity_search(
+                    query_text,
+                    table_name=table,
+                    vector_or_vectors=query_vector,
+                    k=k * 5,
+                    threshold=similarity_threshold,
+                    ef_search=ef_search,
+                    output_format="json",
+                )
+            except Exception:
+                vss_results = []
+            if not fts_results and not vss_results:
+                warnings.warn(f"No results for query={query_text or '<vector>'!r}.")
+                continue
+
+            fts_rank = {r[id_key]: i + 1 for i, r in enumerate(fts_results)}
+            vss_rank = {r[id_key]: i + 1 for i, r in enumerate(vss_results)}
+            combined: Dict[Any, Dict[str, Any]] = {}
+            for row in fts_results + vss_results:
+                uid = row[id_key]
+                combined.setdefault(uid, {}).update(row)
+            for uid in set(fts_rank) | set(vss_rank):
+                score = 0.0
+                if uid in fts_rank:
+                    score += 1.0 / (k_rank + fts_rank[uid])
+                if uid in vss_rank:
+                    score += 1.0 / (k_rank + vss_rank[uid])
+                combined[uid]["score"] = score
+            for uid, row in combined.items():
+                if uid not in final or row["score"] > final[uid]["score"]:
+                    final[uid] = row
+
+        ranked = sorted(final.values(), key=lambda r: (-r["score"], str(r.get(id_key))))[
+            :k
+        ]
+        return format_search_results(ranked, output_format)
+
+    async def hybrid_regex_search(
+        self,
+        text_or_texts: Optional[Union[str, List[str]]] = None,
+        *,
+        pattern_or_patterns: Union[str, List[str], None] = None,
+        table_name: str,
+        vector_or_vectors: Optional[Union[List[float], List[List[float]]]] = None,
+        k: int = 10,
+        k_rank: int = 60,
+        similarity_threshold: Optional[float] = None,
+        fields: Optional[List[str]] = None,
+        case_sensitive: bool = True,
+        ef_search: Optional[int] = None,
+        output_format: str = "json",
+        **kwargs: Any,
+    ):
+        """Reciprocal-Rank-Fusion of vector similarity + regex match.
+
+        Sibling of `hybrid_fts_search`. The vector half embeds
+        ``text_or_texts`` (or uses ``vector_or_vectors`` directly); the
+        regex half matches ``pattern_or_patterns`` against the table's
+        string columns. The two rankings are fused with the RRF formula
+        ``sum(1 / (k_rank + rank))``. Degrades to regex-only when there
+        are no vectors to search with (no embedding model and no
+        ``vector_or_vectors``).
+
+        Args:
+            text_or_texts: Query text (or list) for the vector half.
+                Ignored when ``vector_or_vectors`` is supplied.
+            pattern_or_patterns: Regex pattern (or list) for the regex
+                half. ``None`` skips the regex half.
+            table_name: Target table.
+            vector_or_vectors: Pre-computed query vector(s) for the vector
+                half, used directly instead of embedding ``text_or_texts``.
+            k: Maximum number of rows returned.
+            k_rank: RRF smoothing constant (default 60).
+            similarity_threshold: Optional maximum vector distance.
+            fields: Forwarded to `regex_search`.
+            case_sensitive: Forwarded to `regex_search`.
+            ef_search: Forwarded to the vector branch (`similarity_search`).
+            output_format: ``"json"`` (list of dicts, default) or ``"csv"``
+                (CSV string).
+            **kwargs: Reserved for adapter-specific options.
+        """
+        provided_vectors = normalize_query_vectors(vector_or_vectors)
+        if not text_or_texts and not pattern_or_patterns and provided_vectors is None:
+            return format_search_results([], output_format)
+        table = table_identifier(table_name)
+        full_schema = self._table_json_schema(table, remove_embedding=False)
+        id_key = self._get_id_key(full_schema)
+
+        # The vector branch can run with explicit vectors, or with text
+        # plus a configured embedding model. Without either, degrade to
+        # a regex-only search.
+        can_vector = provided_vectors is not None or (
+            bool(text_or_texts) and bool(self.embedding_model)
+        )
+        if not can_vector:
+            if not pattern_or_patterns:
+                return format_search_results([], output_format)
+            patterns_list = (
+                [pattern_or_patterns]
+                if isinstance(pattern_or_patterns, str)
+                else list(pattern_or_patterns)
+            )
+            merged: Dict[Any, Dict[str, Any]] = {}
+            for p in patterns_list:
+                rows = await self.regex_search(
+                    p,
+                    table_name=table,
+                    fields=fields,
+                    case_sensitive=case_sensitive,
+                    k=k,
+                    output_format="json",
+                )
+                for r in rows:
+                    merged[r[id_key]] = r
+            return format_search_results(list(merged.values())[:k], output_format)
+
+        # Build the per-slot vector-branch input (pre-computed vectors
+        # or texts to embed), then align a pattern to each slot.
+        if provided_vectors is not None:
+            vec_texts: List[Optional[str]] = [None] * len(provided_vectors)
+            vec_vectors: List[Optional[List[float]]] = list(provided_vectors)
+        else:
+            vec_texts = (
+                [text_or_texts] if isinstance(text_or_texts, str) else list(text_or_texts)
+            )
+            vec_vectors = [None] * len(vec_texts)
+        n = len(vec_texts)
+
+        if pattern_or_patterns is None:
+            patterns: List[Optional[str]] = [None] * n
+        elif isinstance(pattern_or_patterns, str):
+            patterns = [pattern_or_patterns] * n
+        else:
+            patterns = list(pattern_or_patterns)
+            if len(patterns) != n:
+                raise ValueError(
+                    "`pattern_or_patterns` must align with the vector-branch queries."
+                )
+
+        final: Dict[Any, Dict[str, Any]] = {}
+        for query_text, query_vector, pattern in zip(vec_texts, vec_vectors, patterns):
+            try:
+                vss_results = await self.similarity_search(
+                    query_text,
+                    table_name=table,
+                    vector_or_vectors=query_vector,
+                    k=k * 5,
+                    threshold=similarity_threshold,
+                    ef_search=ef_search,
+                    output_format="json",
+                )
+            except Exception:
+                vss_results = []
+            regex_results = []
+            if pattern is not None:
+                try:
+                    regex_results = await self.regex_search(
+                        pattern,
+                        table_name=table,
+                        fields=fields,
+                        case_sensitive=case_sensitive,
+                        k=k * 5,
+                        output_format="json",
+                    )
+                except Exception:
+                    regex_results = []
+            if not vss_results and not regex_results:
+                continue
+            vss_rank = {r[id_key]: i + 1 for i, r in enumerate(vss_results)}
+            rgx_rank = {r[id_key]: i + 1 for i, r in enumerate(regex_results)}
+            combined: Dict[Any, Dict[str, Any]] = {}
+            for row in vss_results + regex_results:
+                uid = row[id_key]
+                combined.setdefault(uid, {}).update(row)
+            for uid in set(vss_rank) | set(rgx_rank):
+                score = 0.0
+                if uid in vss_rank:
+                    score += 1.0 / (k_rank + vss_rank[uid])
+                if uid in rgx_rank:
+                    score += 1.0 / (k_rank + rgx_rank[uid])
+                combined[uid]["score"] = score
+            for uid, row in combined.items():
+                if uid not in final or row["score"] > final[uid]["score"]:
+                    final[uid] = row
+
+        ranked = sorted(final.values(), key=lambda r: (-r["score"], str(r.get(id_key))))[
+            :k
+        ]
+        return format_search_results(ranked, output_format)
+
+    def __repr__(self):
+        return f"<LanceDBAdapter uri={self.uri}>"

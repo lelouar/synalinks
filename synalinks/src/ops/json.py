@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend import JsonDataModel
@@ -6,8 +6,6 @@ from synalinks.src.backend import SymbolicDataModel
 from synalinks.src.backend import any_symbolic_data_models
 from synalinks.src.backend import concatenate_json
 from synalinks.src.backend import concatenate_schema
-from synalinks.src.backend import decompose_json
-from synalinks.src.backend import decompose_schema
 from synalinks.src.backend import factorize_json
 from synalinks.src.backend import factorize_schema
 from synalinks.src.backend import in_mask_json
@@ -381,65 +379,6 @@ async def factorize(x, name=None, description=None):
     )(x)
 
 
-class Decompose(Operation):
-    """Decompose a data model by expanding list properties into individuals."""
-
-    def __init__(
-        self,
-        name=None,
-        description=None,
-    ):
-        super().__init__(
-            name=name,
-            description=description,
-        )
-
-    async def call(self, x):
-        if not x:
-            return None
-        json = decompose_json(x.get_json())
-        schema = decompose_schema(x.get_schema())
-        return JsonDataModel(json=json, schema=schema, name=self.name)
-
-    async def compute_output_spec(self, x):
-        schema = decompose_schema(x.get_schema())
-        return SymbolicDataModel(schema=schema, name=self.name)
-
-
-@synalinks_export(
-    ["synalinks.ops.decompose", "synalinks.ops.json.decompose"]
-)
-async def decompose(x, name=None, description=None):
-    """Decompose a data model by expanding list properties into individuals.
-
-    Decomposition is the inverse of factorization. It takes list properties
-    and expands them into individual properties with numerical suffixes.
-    For example `foos: ["a", "b"]` becomes `foo: "a", foo_1: "b"`.
-
-    If the data models used is a metaclass or symbolic data model
-    the output is a symbolic data model.
-
-    This operation is implemented in `.decompose()`
-
-    Args:
-        x (JsonDataModel | SymbolicDataModel): the input data model.
-        name (str): Optional. The name of the operation.
-        description (str): Optional. The description of the operation.
-
-    Returns:
-        (JsonDataModel | SymbolicDataModel): The resulting data model.
-    """
-    if any_symbolic_data_models(x):
-        return await Decompose(
-            name=name,
-            description=description,
-        ).symbolic_call(x)
-    return await Decompose(
-        name=name,
-        description=description,
-    )(x)
-
-
 class OutMask(Operation):
     """Mask specific fields of a data model."""
 
@@ -486,9 +425,7 @@ class OutMask(Operation):
         return SymbolicDataModel(schema=schema, name=self.name)
 
 
-@synalinks_export(
-    ["synalinks.ops.out_mask", "synalinks.ops.json.out_mask"]
-)
+@synalinks_export(["synalinks.ops.out_mask", "synalinks.ops.json.out_mask"])
 async def out_mask(
     x,
     mask=None,
@@ -521,9 +458,7 @@ async def out_mask(
         (JsonDataModel | SymbolicDataModel): The resulting data model.
     """
     if mask is None and pattern is None:
-        raise ValueError(
-            "You should specify the `mask` or `pattern` argument"
-        )
+        raise ValueError("You should specify the `mask` or `pattern` argument")
     if any_symbolic_data_models(x):
         return await OutMask(
             mask=mask,
@@ -587,9 +522,7 @@ class InMask(Operation):
         return SymbolicDataModel(schema=schema, name=self.name)
 
 
-@synalinks_export(
-    ["synalinks.ops.in_mask", "synalinks.ops.json.in_mask"]
-)
+@synalinks_export(["synalinks.ops.in_mask", "synalinks.ops.json.in_mask"])
 async def in_mask(
     x,
     mask=None,
@@ -622,9 +555,7 @@ async def in_mask(
         (JsonDataModel | SymbolicDataModel): The resulting data model.
     """
     if mask is None and pattern is None:
-        raise ValueError(
-            "You should specify the `mask` or `pattern` argument"
-        )
+        raise ValueError("You should specify the `mask` or `pattern` argument")
     if any_symbolic_data_models(x):
         return await InMask(
             mask=mask,

@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import inspect
 
@@ -202,19 +202,6 @@ class MetaDataModel(type(pydantic.BaseModel)):
 
         return run_maybe_nested(ops.Factorize().symbolic_call(cls))
 
-    def decompose(cls):
-        """Decomposes the data model.
-
-        This is the inverse of factorize. It expands list properties
-        into individual properties with numerical suffixes.
-
-        Returns:
-            (SymbolicDataModel): The decomposed data model.
-        """
-        from synalinks.src import ops
-
-        return run_maybe_nested(ops.Decompose().symbolic_call(cls))
-
     def in_mask(cls, mask=None, pattern=None, recursive=True):
         """Applies a mask to **keep only** specified keys of the data model.
 
@@ -230,9 +217,7 @@ class MetaDataModel(type(pydantic.BaseModel)):
         from synalinks.src import ops
 
         return run_maybe_nested(
-            ops.InMask(
-                mask=mask, pattern=pattern, recursive=True
-            ).symbolic_call(cls)
+            ops.InMask(mask=mask, pattern=pattern, recursive=True).symbolic_call(cls)
         )
 
     def out_mask(cls, mask=None, pattern=None, recursive=True):
@@ -250,9 +235,7 @@ class MetaDataModel(type(pydantic.BaseModel)):
         from synalinks.src import ops
 
         return run_maybe_nested(
-            ops.OutMask(
-                mask=mask, pattern=pattern, recursive=True
-            ).symbolic_call(cls)
+            ops.OutMask(mask=mask, pattern=pattern, recursive=True).symbolic_call(cls)
         )
 
     def prefix(cls, prefix=None):
@@ -364,10 +347,19 @@ class DataModel(pydantic.BaseModel, SynalinksSaveable, metaclass=MetaDataModel):
     def get_json(self):
         """Gets the JSON value of the data model.
 
+        Optional fields whose value is `None` are omitted from the output;
+        the schema still declares them, so consumers should treat a missing
+        key as `None`.
+
+        Serialization is duck-typed (``serialize_as_any``): a field declared
+        with a parent type (e.g. ``List[Entity]``) dumps each item with the
+        *instance's* fields, so `Entity`/`Relation` subclasses keep their
+        properties inside a generic `KnowledgeGraph`.
+
         Returns:
             (dict): The JSON value.
         """
-        return self.model_dump(mode="json")
+        return self.model_dump(mode="json", exclude_none=True, serialize_as_any=True)
 
     def prettify_json(self):
         """Get a pretty version of the JSON object for display.
@@ -417,6 +409,37 @@ class DataModel(pydantic.BaseModel, SynalinksSaveable, metaclass=MetaDataModel):
             json=self.get_json(),
             name=name,
         )
+
+    def get_nested_entity(self, key):
+        """Retrieve a nested Entity and convert it to a JsonDataModel.
+
+        The entity's `label` field is used as the discriminator to look up
+        its schema in this model's `$defs`. Returns ``None`` when the value
+        at ``key`` has no ``label`` or when the schema cannot be resolved.
+
+        Args:
+            key (str): The field name holding the nested entity.
+
+        Returns:
+            (JsonDataModel | None): A typed JsonDataModel wrapping the
+                nested entity, or ``None`` if the value isn't an entity.
+        """
+        return self.to_json_data_model().get_nested_entity(key)
+
+    def get_nested_entity_list(self, key):
+        """Retrieve a nested Entity list and convert it to typed JsonDataModels.
+
+        Each item is resolved against this model's `$defs` using its
+        ``label`` field as discriminator. Items without a ``label`` field
+        or an unresolved schema are skipped.
+
+        Args:
+            key (str): The field name holding the list of nested entities.
+
+        Returns:
+            (list[JsonDataModel]): One JsonDataModel per resolved entity.
+        """
+        return self.to_json_data_model().get_nested_entity_list(key)
 
     def __add__(self, other):
         """Concatenates this data model with another.

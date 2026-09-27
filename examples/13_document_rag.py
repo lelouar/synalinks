@@ -79,7 +79,7 @@ answer = await synalinks.Generator(
 
 ## API References
 
-- [KnowledgeBase](https://synalinks.github.io/synalinks/Synalinks%20API/Knowledge%20Bases%20API/)
+- [KnowledgeBase](https://synalinks.github.io/synalinks/Synalinks%20API/Knowledge%20Base%20API/Knowledge%20Base/)
 - [RetrieveKnowledge](https://synalinks.github.io/synalinks/Synalinks%20API/Modules%20API/Knowledge%20Modules/RetrieveKnowledge%20module/)
 - [Generator](https://synalinks.github.io/synalinks/Synalinks%20API/Modules%20API/Core%20Modules/Generator%20module/)
 - [EmbeddingModel](https://synalinks.github.io/synalinks/Synalinks%20API/Embedding%20Models%20API/)
@@ -139,18 +139,18 @@ async def main():
     load_dotenv()
 
     # Enable observability for tracing
-    synalinks.enable_observability(
-        tracking_uri="http://localhost:5000",
-        experiment_name="document_rag_pipeline",
-    )
+#     synalinks.enable_observability(
+#         tracking_uri="http://localhost:5000",
+#         experiment_name="document_rag_pipeline",
+#     )
 
     # Initialize models
     language_model = synalinks.LanguageModel(
-        model="gemini/gemini-2.0-flash",
+        model="ollama/mistral:latest",
     )
 
     embedding_model = synalinks.EmbeddingModel(
-        model="gemini/text-embedding-004",
+        model="ollama/all-minilm",
     )
 
     # Clean up any existing database
@@ -374,13 +374,17 @@ async def main():
 
     # Full-text search
     print("\nFull-text search for 'transformer':")
-    results = await knowledge_base.fulltext_search("transformer", k=3)
+    results = await knowledge_base.fulltext_search(
+        "transformer", table_name="Document", k=3
+    )
     for r in results:
         print(f"  - Document ID: {r.get('id')}, Score: {r.get('score', 'N/A'):.4f}")
 
-    # Hybrid search
+    # Hybrid search: vector + BM25 fulltext, fused with RRF.
     print("\nHybrid search for 'how computers learn from data':")
-    results = await knowledge_base.hybrid_search("how computers learn from data", k=3)
+    results = await knowledge_base.hybrid_fts_search(
+        "how computers learn from data", table_name="Document", k=3
+    )
     for r in results:
         print(f"  - Document ID: {r.get('id')}, Score: {r.get('score', 'N/A'):.4f}")
 
@@ -390,8 +394,7 @@ async def main():
     print("\n\nStep 6: All Documents in Knowledge Base")
     print("=" * 60)
 
-    doc_model = knowledge_base.get_symbolic_data_models()[0]
-    all_docs = await knowledge_base.getall(doc_model, limit=20)
+    all_docs = await knowledge_base.getall(table_name="Document", limit=20)
 
     for doc in all_docs:
         data = doc.get_json()

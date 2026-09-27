@@ -1,0 +1,245 @@
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
+
+from synalinks.src import testing
+from synalinks.src.backend import DataModel
+from synalinks.src.metrics.accuracy_metrics import Accuracy
+from synalinks.src.metrics.agents_metrics import PassAtK
+from synalinks.src.metrics.reduction_metrics import Mean
+from synalinks.src.rewards.exact_match import ExactMatch
+from synalinks.src.rewards.reward_wrappers import RewardFunctionWrapper
+from synalinks.src.trainers.compile_utils import CompileMetrics
+from synalinks.src.trainers.compile_utils import CompileReward
+from synalinks.src.trainers.compile_utils import MetricsList
+from synalinks.src.trainers.compile_utils import get_reward
+from synalinks.src.trainers.compile_utils import is_function_like
+
+
+class Answer(DataModel):
+    answer: str
+
+
+class BatchMetricRoutingTest(testing.TestCase):
+    """`update_state_batch` must feed a `BatchMetric` the whole batch while
+    ordinary metrics keep their per-sample updates."""
+
+    async def test_batch_and_per_sample_metrics_coexist(self):
+        # One problem's 4 samples, 1 correct.
+        y_true = [Answer(answer="correct") for _ in range(4)]
+        y_pred = [Answer(answer="correct")] + [Answer(answer="wrong") for _ in range(3)]
+
+        cm = CompileMetrics(metrics=[PassAtK(k=1), Accuracy(name="acc")])
+        await cm.update_state_batch(y_true, y_pred)
+        results = cm.result()
+
+        # pass@1 over (n=4, c=1) = 1 - C(3,1)/C(4,1) = 0.25 (the whole batch).
+        self.assertAlmostEqual(results["pass_at_k"], 0.25, places=6)
+        # The per-sample metric still ran on all 4 samples (1 exact match).
+        self.assertIn("acc", results)
+
+
+class IsFunctionLikeTest(testing.TestCase):
+    def test_none_str_callable_pass(self):
+        self.assertTrue(is_function_like(None))
+        self.assertTrue(is_function_like("mean"))
+        self.assertTrue(is_function_like(lambda x: x))
+
+    def test_other_objects_fail(self):
+        self.assertFalse(is_function_like(42))
+        self.assertFalse(is_function_like({"key": "value"}))
+
+
+class CompileMetricsValidationTest(testing.TestCase):
+    """Cover the error paths in `CompileMetrics.__init__` /
+    `_build_metrics_set` that fire before any update_state call."""
+
+    def test_rejects_non_collection_metrics(self):
+        with self.assertRaisesRegex(ValueError, "list, tuple, or dict"):
+            CompileMetrics(metrics=42)
+
+    def test_unbuilt_variables_returns_empty(self):
+        cm = CompileMetrics(metrics=[Mean(name="m")])
+        # Before `build()`, variables is the empty list (early-exit branch).
+        self.assertEqual(cm.variables, [])
+        self.assertEqual(cm.metrics, [])
+
+    async def test_unbuilt_reset_state_resets_user_metrics(self):
+        # `build()` is lazy, but `evaluate`/`fit` call `reset_metrics()` BEFORE
+        # the first `update_state`. When the metric instance is shared across
+        # programs (e.g. one metrics list reused for every trial of a sweep),
+        # an unbuilt reset that no-op'd would let a previous program's state
+        # leak into the next one. So reset must clear the raw user metrics too.
+        m = Mean(name="m")
+        await m.update_state(4.0)
+        self.assertEqual(m.result(), 4.0)
+
+        cm = CompileMetrics(metrics=[m])  # unbuilt: build() not called yet
+        cm.reset_state()  # must not raise, and must clear the shared metric
+
+        self.assertFalse(cm.built)
+        self.assertEqual(m.result(), 0.0)
+
+    def test_result_before_build_raises(self):
+        cm = CompileMetrics(metrics=[Mean(name="m")])
+        with self.assertRaisesRegex(ValueError, "has not yet been built"):
+            cm.result()
+
+    def test_metrics_list_get_config_not_implemented(self):
+        ml = MetricsList([Mean(name="m")])
+        with self.assertRaises(NotImplementedError):
+            ml.get_config()
+        with self.assertRaises(NotImplementedError):
+            MetricsList.from_config({})
+
+    def test_compile_metrics_get_config_not_implemented(self):
+        cm = CompileMetrics(metrics=[Mean(name="m")])
+        with self.assertRaises(NotImplementedError):
+            cm.get_config()
+        with self.assertRaises(NotImplementedError):
+            CompileMetrics.from_config({})
+
+
+class CompileMetricsBuildErrorPathsTest(testing.TestCase):
+    """`_build_metrics_set` rejects malformed metric configs at build time."""
+
+    def _build(self, **kw):
+        # Build is sync; the y_true/y_pred shape is what triggers the
+        # multi-output branches we want to exercise.
+        cm = CompileMetrics(**kw)
+        return cm
+
+    def test_dict_metrics_with_unknown_output_name_raises(self):
+        cm = self._build(
+            metrics={"only_a": [Mean(name="m")]},
+            output_names=["a", "b"],
+        )
+        with self.assertRaisesRegex(ValueError, "does not correspond to any"):
+            cm.build(y_true=[None, None], y_pred=[None, None])
+
+    def test_list_metrics_wrong_length_raises(self):
+        cm = self._build(metrics=[[Mean(name="m1")], [Mean(name="m2")]])
+        # 2 metric sublists but 3 outputs → mismatch raises.
+        with self.assertRaisesRegex(ValueError, "many entries as the program has"):
+            cm.build(y_true=[None, None, None], y_pred=[None, None, None])
+
+    def test_list_metrics_with_non_metric_entry_raises(self):
+        cm = self._build(metrics=[[Mean(name="m1")], [42]])
+        with self.assertRaisesRegex(ValueError, "should be metric objects"):
+            cm.build(y_true=[None, None], y_pred=[None, None])
+
+    def test_dict_metrics_with_non_metric_entry_raises(self):
+        cm = self._build(
+            metrics={"a": [42]},
+            output_names=["a", "b"],
+        )
+        with self.assertRaisesRegex(ValueError, "should be metric objects"):
+            cm.build(y_true=[None, None], y_pred=[None, None])
+
+    def test_dict_metrics_without_output_names_raises(self):
+        # Dict-shaped metrics need output names to match against; with
+        # `output_names=None` the helper must raise with the intended
+        # ValueError (not a TypeError on `None in None`).
+        cm = self._build(metrics={"a": Mean(name="m")})
+        with self.assertRaisesRegex(ValueError, "can only be provided as a dict"):
+            cm.build(y_true=[None, None], y_pred=[None, None])
+
+    def test_single_output_list_of_non_metrics_raises(self):
+        cm = self._build(metrics=[42])
+        with self.assertRaisesRegex(ValueError, "to be metric objects"):
+            cm.build(y_true=None, y_pred=None)
+
+
+class CompileMetricsResultDedupeTest(testing.TestCase):
+    """`result()` deduplicates colliding metric names across outputs."""
+
+    async def test_same_metric_name_across_outputs_gets_indexed(self):
+        cm = CompileMetrics(
+            metrics=[[Mean(name="reward")], [Mean(name="reward")]],
+            output_names=["a", "b"],
+        )
+        cm.build(y_true=[1.0, 2.0], y_pred=[1.0, 2.0])
+        # First output's MetricsList has no `output_name` because we didn't
+        # set it; both metrics share the bare name "reward" → second one is
+        # renamed "reward_1".
+        # Note: with output_names provided, both get output-prefixed names
+        # like "a_reward" / "b_reward": distinct, so no dedupe triggers.
+        # Force collision by stripping output_name from one MetricsList.
+        cm._flat_metrics[1].output_name = None
+        cm._flat_metrics[0].output_name = None
+        results = cm.result()
+        self.assertIn("reward", results)
+        self.assertIn("reward_1", results)
+
+
+class CompileRewardValidationTest(testing.TestCase):
+    """Reward-side mirror of CompileMetricsValidationTest."""
+
+    def test_invalid_reward_weights_type_raises(self):
+        with self.assertRaisesRegex(ValueError, "Expected `reward_weights`"):
+            CompileReward(reward=ExactMatch(), reward_weights="not-a-weight")
+
+    def test_metrics_property_default_empty(self):
+        cr = CompileReward(reward=ExactMatch())
+        # Before build, _metrics is the empty list registered with Tracker.
+        self.assertEqual(cr.metrics, [])
+        self.assertEqual(cr.variables, [])
+
+    async def test_has_batch_rewards_false_before_build(self):
+        cr = CompileReward(reward=ExactMatch())
+        self.assertFalse(cr.has_batch_rewards)
+
+
+class BareRewardCallableTest(testing.TestCase):
+    """`compile(reward=fn)` accepts a bare async function and wraps it."""
+
+    def test_bare_async_fn_is_auto_wrapped_and_named(self):
+        async def answer_matches(y_true, y_pred):
+            return 1.0
+
+        y = Answer(answer="42").to_json_data_model()
+        reward = get_reward(answer_matches, y, y)
+
+        self.assertIsInstance(reward, RewardFunctionWrapper)
+        self.assertEqual(reward.name, "answer_matches")
+
+    async def test_auto_wrapped_fn_is_awaited(self):
+        async def always_one(y_true, y_pred):
+            return 1.0
+
+        y = Answer(answer="42").to_json_data_model()
+        reward = get_reward(always_one, y, y)
+        self.assertEqual(await reward(y, y), 1.0)
+
+    def test_bare_sync_fn_raises_naming_the_function(self):
+        def always_one(y_true, y_pred):
+            return 1.0
+
+        y = Answer(answer="42").to_json_data_model()
+        with self.assertRaisesRegex(TypeError, "always_one"):
+            get_reward(always_one, y, y)
+
+
+class CompileRewardMultiOutputTest(testing.TestCase):
+    """Cover the multi-output (nested) path of ``CompileReward.call``."""
+
+    async def test_multi_output_dict_call_awaits_each_reward(self):
+        compile_reward = CompileReward(
+            reward={"a": ExactMatch(), "b": ExactMatch()},
+            output_names=["a", "b"],
+        )
+        y_true = {"a": Answer(answer="x"), "b": Answer(answer="y")}
+        y_pred = {"a": Answer(answer="x"), "b": Answer(answer="y")}
+
+        result = await compile_reward(y_true, y_pred)
+        # Both outputs match → 1.0 + 1.0 = 2.0.
+        self.assertEqual(float(result), 2.0)
+
+    async def test_multi_output_partial_match(self):
+        compile_reward = CompileReward(
+            reward={"a": ExactMatch(), "b": ExactMatch()},
+            output_names=["a", "b"],
+        )
+        y_true = {"a": Answer(answer="x"), "b": Answer(answer="y")}
+        y_pred = {"a": Answer(answer="x"), "b": Answer(answer="WRONG")}
+
+        result = await compile_reward(y_true, y_pred)
+        self.assertEqual(float(result), 1.0)

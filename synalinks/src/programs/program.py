@@ -1,10 +1,11 @@
 # Modified from: keras/src/models/model.py
 # Original authors: François Chollet et al. (Keras Team)
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import inspect
 import typing
 import warnings
+from types import SimpleNamespace
 
 import orjson
 
@@ -15,6 +16,7 @@ from synalinks.src.trainers.trainer import Trainer
 from synalinks.src.utils import file_utils
 from synalinks.src.utils import io_utils
 from synalinks.src.utils import summary_utils
+from synalinks.src.version import __version__
 
 
 @synalinks_export(["synalinks.Program", "synalinks.programs.Program"])
@@ -448,6 +450,7 @@ class Program(Trainer, Module):
 
         The saved `.json` file contains:
 
+        - The Synalinks version used to save it
         - The program's configuration (architecture)
         - The program's variables
         - The program's optimizer's state (if any)
@@ -470,8 +473,17 @@ class Program(Trainer, Module):
                 f"The filepath should ends with '.json', received filepath={filepath}"
             )
         program_config = serialization_lib.serialize_synalinks_object(self)
+        program_config = {"synalinks_version": __version__, **program_config}
         variables_config = self.get_state_tree()
         program_config.update({"variables": variables_config})
+        if getattr(self, "_mlflow_model_id", None):
+            # Lineage written by `callbacks.Monitor`, read back by `load()`.
+            program_config["mlflow"] = {
+                "model_id": self._mlflow_model_id,
+                "run_id": getattr(self, "_mlflow_run_id", None),
+                "experiment_id": getattr(self, "_mlflow_experiment_id", None),
+                "prompts": getattr(self, "_mlflow_prompts", None) or {},
+            }
         program_config_string = orjson.dumps(
             program_config, option=orjson.OPT_INDENT_2
         ).decode()
@@ -492,7 +504,7 @@ class Program(Trainer, Module):
                 try:
                     await self.build(config["input_schema"])
                     status = True
-                except:
+                except Exception:
                     pass
             self._build_schemas_dict = config
 
@@ -504,7 +516,7 @@ class Program(Trainer, Module):
                 try:
                     await self.build(**config["schemas_dict"])
                     status = True
-                except:
+                except Exception:
                     pass
             self._build_schemas_dict = config["schemas_dict"]
 
@@ -544,6 +556,7 @@ class Program(Trainer, Module):
         from synalinks.src.saving import serialization_lib
 
         program_config = serialization_lib.serialize_synalinks_object(self)
+        program_config = {"synalinks_version": __version__, **program_config}
         return orjson.dumps(program_config, **kwargs).decode()
 
     @classmethod
@@ -838,10 +851,23 @@ def program_from_json(json_string, custom_objects=None):
 
     program_config = orjson.loads(json_string)
     variables_config = program_config.get("variables")
+    mlflow_config = program_config.pop("mlflow", None) or {}
     program = serialization_lib.deserialize_synalinks_object(
         program_config, custom_objects=custom_objects
     )
     program.set_state_tree(variables_config)
+    if mlflow_config.get("model_id"):
+        program._mlflow_model_id = mlflow_config["model_id"]
+        program._mlflow_run_id = mlflow_config.get("run_id")
+        program._mlflow_experiment_id = mlflow_config.get("experiment_id")
+        prompts = mlflow_config.get("prompts") or {}
+        program._mlflow_prompts = prompts
+        # Re-attach each module's registered prompt version so its traces
+        # keep linking to it (`hooks.Monitor`).
+        for module in program._flatten_modules(include_self=False, recursive=True):
+            prompt = prompts.get(module.name)
+            if prompt:
+                module._mlflow_prompt_version = SimpleNamespace(**prompt)
     return program
 
 

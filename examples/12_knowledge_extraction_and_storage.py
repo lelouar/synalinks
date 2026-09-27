@@ -100,7 +100,7 @@ results = await synalinks.RetrieveKnowledge(
 
 ## API References
 
-- [KnowledgeBase](https://synalinks.github.io/synalinks/Synalinks%20API/Knowledge%20Bases%20API/)
+- [KnowledgeBase](https://synalinks.github.io/synalinks/Synalinks%20API/Knowledge%20Base%20API/Knowledge%20Base/)
 - [UpdateKnowledge](https://synalinks.github.io/synalinks/Synalinks%20API/Modules%20API/Knowledge%20Modules/UpdateKnowledge%20module/)
 - [RetrieveKnowledge](https://synalinks.github.io/synalinks/Synalinks%20API/Modules%20API/Knowledge%20Modules/RetrieveKnowledge%20module/)
 - [Generator](https://synalinks.github.io/synalinks/Synalinks%20API/Modules%20API/Core%20Modules/Generator%20module/)
@@ -188,18 +188,18 @@ async def main():
     load_dotenv()
 
     # Enable observability for tracing
-    synalinks.enable_observability(
-        tracking_uri="http://localhost:5000",
-        experiment_name="knowledge_extraction",
-    )
+#     synalinks.enable_observability(
+#         tracking_uri="http://localhost:5000",
+#         experiment_name="knowledge_extraction",
+#     )
 
     # Initialize models
     language_model = synalinks.LanguageModel(
-        model="gemini/gemini-2.0-flash",
+        model="ollama/mistral:latest",
     )
 
     embedding_model = synalinks.EmbeddingModel(
-        model="gemini/text-embedding-004",
+        model="ollama/mxbai-embed-large",
     )
 
     # Clean up any existing database
@@ -362,13 +362,15 @@ async def main():
 
     # Full-text search for invoices
     print("\nSearch for 'cloud' in invoices:")
-    results = await knowledge_base.fulltext_search("cloud", k=5)
+    results = await knowledge_base.fulltext_search("cloud", table_name="Invoice", k=5)
     for r in results:
         print(f"  Found: {r}")
 
-    # Hybrid search
+    # Hybrid search (vector + BM25 fulltext, fused with RRF)
     print("\nSearch for 'office equipment purchase':")
-    results = await knowledge_base.hybrid_search("office equipment purchase", k=5)
+    results = await knowledge_base.hybrid_fts_search(
+        "office equipment purchase", table_name="Invoice", k=5
+    )
     for r in results:
         print(f"  Found: {r}")
 
@@ -433,7 +435,7 @@ async def main():
 
     for dm in data_models:
         table_name = dm.get_schema()["title"]
-        records = await knowledge_base.getall(dm, limit=10)
+        records = await knowledge_base.getall(table_name=table_name, limit=10)
         print(f"\n{table_name} ({len(records)} records):")
         for record in records:
             json_data = record.get_json()

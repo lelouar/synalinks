@@ -1,6 +1,6 @@
 # Modified from: keras/src/backend/common/keras_tensor.py
 # Original authors: François Chollet et al. (Keras Team)
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import orjson
 
@@ -326,19 +326,6 @@ class SymbolicDataModel(SynalinksSaveable):
 
         return run_maybe_nested(ops.Factorize().symbolic_call(self))
 
-    def decompose(self):
-        """Decomposes the data model.
-
-        This is the inverse of factorize. It expands list properties
-        into individual properties with numerical suffixes.
-
-        Returns:
-            (SymbolicDataModel): The decomposed data model.
-        """
-        from synalinks.src import ops
-
-        return run_maybe_nested(ops.Decompose().symbolic_call(self))
-
     def in_mask(self, mask=None, pattern=None, recursive=True):
         """Applies a mask to **keep only** specified keys of the data model.
 
@@ -354,9 +341,7 @@ class SymbolicDataModel(SynalinksSaveable):
         from synalinks.src import ops
 
         return run_maybe_nested(
-            ops.InMask(
-                mask=mask, pattern=pattern, recursive=True
-            ).symbolic_call(self)
+            ops.InMask(mask=mask, pattern=pattern, recursive=True).symbolic_call(self)
         )
 
     def out_mask(self, mask=None, pattern=None, recursive=True):
@@ -374,9 +359,7 @@ class SymbolicDataModel(SynalinksSaveable):
         from synalinks.src import ops
 
         return run_maybe_nested(
-            ops.OutMask(
-                mask=mask, pattern=pattern, recursive=True
-            ).symbolic_call(self)
+            ops.OutMask(mask=mask, pattern=pattern, recursive=True).symbolic_call(self)
         )
 
     def prefix(self, prefix=None):

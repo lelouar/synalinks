@@ -1,7 +1,8 @@
 # Modified from: keras/src/trainers/compile_utils.py
 # Original authors: François Chollet et al. (Keras Team)
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
+import asyncio
 from collections import namedtuple
 
 from synalinks.src import metrics as metrics_module
@@ -10,6 +11,8 @@ from synalinks.src import rewards as rewards_module
 from synalinks.src import tree
 from synalinks.src.backend.common import numpy
 from synalinks.src.backend.common.symbolic_data_model import SymbolicDataModel
+from synalinks.src.metrics.batch_metric import BatchMetric
+from synalinks.src.rewards.batch_reward import BatchReward
 from synalinks.src.utils.naming import get_object_name
 from synalinks.src.utils.tracking import Tracker
 
@@ -23,6 +26,15 @@ class MetricsList(metrics_module.Metric):
     async def update_state(self, y_true, y_pred):
         for m in self.metrics:
             await m.update_state(y_true, y_pred)
+
+    async def update_state_batch(self, y_true_batch, y_pred_batch):
+        """Update over a whole batch: batch metrics once, others per-sample."""
+        for m in self.metrics:
+            if isinstance(m, BatchMetric):
+                await m.update_state(y_true_batch, y_pred_batch)
+            else:
+                for y_t, y_p in zip(y_true_batch, y_pred_batch):
+                    await m.update_state(y_t, y_p)
 
     def reset_state(self):
         for m in self.metrics:
@@ -74,6 +86,10 @@ def get_reward(identifier, y_true, y_pred):
     reward_obj = rewards_module.get(identifier)
 
     if not isinstance(reward_obj, rewards_module.Reward):
+        # A bare callable is auto-wrapped as a per-sample reward. Batched
+        # callables must be passed already wrapped in
+        # `BatchRewardFunctionWrapper` since their signature
+        # (batch -> list[float]) is not distinguishable at this point.
         if isinstance(identifier, str):
             reward_name = identifier
         else:
@@ -160,6 +176,16 @@ class CompileMetrics(metrics_module.Metric):
     ):
         flat_metrics = []
         if isinstance(metrics, dict):
+            # Without output names the dict-keyed form is meaningless: the
+            # keys can't be matched to outputs. Raise with the intended
+            # message instead of letting the membership check below crash
+            # on ``None``.
+            if output_names is None:
+                raise ValueError(
+                    f"Argument `{argument_name}` can only be provided as a "
+                    "dict when the program also returns a dict of outputs. "
+                    f"Received {argument_name}={metrics}"
+                )
             for name in metrics.keys():
                 if name not in output_names:
                     raise ValueError(
@@ -219,12 +245,8 @@ class CompileMetrics(metrics_module.Metric):
                         )
                     )
             elif isinstance(metrics, dict):
-                if output_names is None:
-                    raise ValueError(
-                        f"Argument `{argument_name}` can only be provided as a "
-                        "dict when the program also returns a dict of outputs. "
-                        f"Received {argument_name}={metrics}"
-                    )
+                # ``output_names is None`` is already rejected at the top
+                # of this function for dict-shaped metrics.
                 for name in metrics.keys():
                     if not isinstance(metrics[name], list):
                         metrics[name] = [metrics[name]]
@@ -269,8 +291,38 @@ class CompileMetrics(metrics_module.Metric):
             if m is not None:
                 await m.update_state(y_t, y_p)
 
+    async def update_state_batch(self, y_true_batch, y_pred_batch):
+        """Update every metric over a whole batch.
+
+        `BatchMetric` instances (e.g. `PassAtK`) receive the full per-output
+        batch at once; ordinary metrics are updated sample-by-sample. This is
+        the metric-side counterpart of `CompileReward.compute_batch`.
+        """
+        if not self.built:
+            self.build(y_true_batch[0], y_pred_batch[0])
+        # Flatten each sample to its per-output list, then transpose so each
+        # output gets the batch of its values across samples.
+        y_true_flat = [self._flatten_y(y_t) for y_t in y_true_batch]
+        y_pred_flat = [self._flatten_y(y_p) for y_p in y_pred_batch]
+        for i, m in enumerate(self._flat_metrics):
+            if m is None:
+                continue
+            y_t_batch = [sample[i] for sample in y_true_flat]
+            y_p_batch = [sample[i] for sample in y_pred_flat]
+            await m.update_state_batch(y_t_batch, y_p_batch)
+
     def reset_state(self):
         if not self.built:
+            # Building is lazy (first `update_state`), but a reset can arrive
+            # first -- `evaluate`/`fit` call `reset_metrics()` before any
+            # update. If the user-supplied metric instances are shared across
+            # programs (e.g. one metrics list reused for every trial of a
+            # tuner sweep), skipping the reset here lets one program's
+            # accumulated state leak into the next program's run. Reset the
+            # raw user metrics directly so shared instances start clean.
+            for m in tree.flatten(self._user_metrics):
+                if isinstance(m, metrics_module.Metric):
+                    m.reset_state()
             return
         for m in self._flat_metrics:
             if m:
@@ -534,7 +586,7 @@ class CompileReward(rewards_module.Reward):
 
         try:
             output_names = tree.pack_sequence_as(y_pred, flat_output_names)
-        except:
+        except Exception:
             inferred_flat_output_names = self._get_y_pred_output_names(y_pred)
             output_names = tree.pack_sequence_as(y_pred, inferred_flat_output_names)
 
@@ -565,6 +617,63 @@ class CompileReward(rewards_module.Reward):
         else:
             output_names = [None] * len(flat_y_pred)
         return output_names
+
+    @property
+    def has_batch_rewards(self):
+        """True if any flat reward is a ``BatchReward`` instance."""
+        if not self.built or not self._flat_rewards:
+            return False
+        return any(
+            isinstance(_reward.reward, BatchReward) for _reward in self._flat_rewards
+        )
+
+    async def compute_batch(self, y_true_batch, y_pred_batch):
+        """Run flat rewards over a whole batch, returning per-sample totals.
+
+        Each ``BatchReward`` is invoked once with the full per-sample list;
+        per-sample rewards are invoked sample-by-sample via
+        ``asyncio.gather``. Their per-sample outputs are summed
+        element-wise across flat rewards. Returns a ``list[float]`` of
+        length ``len(y_pred_batch)``.
+        """
+        if not self.built:
+            sample_y_true = (
+                y_true_batch[0] if hasattr(y_true_batch, "__len__") else y_true_batch
+            )
+            sample_y_pred = (
+                y_pred_batch[0] if hasattr(y_pred_batch, "__len__") else y_pred_batch
+            )
+            self.build(sample_y_true, sample_y_pred)
+
+        n = len(y_pred_batch)
+        metrics = [None] if len(self.metrics) == 0 else self.metrics
+        totals = [0.0] * n
+
+        def resolve_path(path, obj):
+            for _path in path:
+                obj = obj[_path]
+            return obj
+
+        for (path, reward_fn, _reward_weight, _name), metric in zip(
+            self._flat_rewards, metrics
+        ):
+            y_t_batch = [resolve_path(path, y_t) for y_t in y_true_batch]
+            y_p_batch = [resolve_path(path, y_p) for y_p in y_pred_batch]
+
+            if isinstance(reward_fn, BatchReward):
+                per_sample = await reward_fn.compute_batch(y_t_batch, y_p_batch)
+            else:
+                results = await asyncio.gather(
+                    *[reward_fn(y_t, y_p) for y_t, y_p in zip(y_t_batch, y_p_batch)]
+                )
+                per_sample = [float(v) if v is not None else 0.0 for v in results]
+
+            if metric is not None:
+                metric.update_state(numpy.convert_to_tensor(per_sample))
+            for i, v in enumerate(per_sample):
+                totals[i] += float(v)
+
+        return totals
 
     async def __call__(self, y_true, y_pred):
         with ops.name_scope(self.name):
@@ -599,14 +708,14 @@ class CompileReward(rewards_module.Reward):
 
             try:
                 y_true = tree.pack_sequence_as(y_pred, y_true)
-            except:
+            except Exception:
                 # Check case where y_true has the same structure but uses
                 # different (but reconcilable) container types,
                 # e.g `list` vs `tuple`.
                 try:
                     tree.assert_same_paths(y_true, y_pred)
                     y_true = tree.pack_sequence_as(y_pred, tree.flatten(y_true))
-                except:
+                except Exception:
                     try:
                         # Check case where reward is partially defined over y_pred
                         flat_y_true = tree.flatten(y_true)
@@ -621,7 +730,7 @@ class CompileReward(rewards_module.Reward):
                         for y_t, (i, reward) in zip(flat_y_true, flat_reward_non_nones):
                             y_true[i] = y_t
                         y_true = tree.pack_sequence_as(self._user_reward, y_true)
-                    except:
+                    except Exception:
                         y_true_struct = tree.map_structure(lambda _: "*", y_true)
                         y_pred_struct = tree.map_structure(lambda _: "*", y_pred)
                         raise ValueError(
@@ -660,7 +769,7 @@ class CompileReward(rewards_module.Reward):
         ):
             y_t, y_p = resolve_path(path, y_true), resolve_path(path, y_pred)
 
-            value = numpy.convert_to_tensor(reward_fn(y_t, y_p))
+            value = numpy.convert_to_tensor(await reward_fn(y_t, y_p))
             # Record *unweighted* individual rewards.
             if metric:
                 metric.update_state(value)

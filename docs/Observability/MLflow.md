@@ -6,11 +6,21 @@ Synalinks provides built-in observability through MLflow, enabling you to trace 
 
 The observability system automatically creates spans for each module call, capturing:
 
-- **Inputs and outputs** of each module
-- **Duration** of each call
-- **Cost** information (when available from the language model)
-- **Success/failure status**
+- **Inputs and outputs** of each module; language model and decision model spans
+  carry the chat messages and tools in OpenAI format, so the MLflow UI renders the
+  conversation
+- **Token usage and cost** on language model and decision model spans, using
+  MLflow's standard `mlflow.chat.tokenUsage`, `mlflow.llm.cost`, `mlflow.llm.model`
+  and `mlflow.llm.provider` attributes, so the trace-level token and cost roll-ups
+  work
+- **Duration** and **success/failure status** of each call, including the model
+  calls that failed every retry (they return `None` instead of raising)
 - **Parent-child relationships** between nested module calls
+- **Phase tags**: every trace is tagged `synalinks.program` and `synalinks.phase`
+  (`inference`, `reward` or `optimizer`), so the calls made by rewards and optimizers
+  during training can be filtered out of production views
+- **Linked prompts**: calls of a module whose prompt was registered in the Prompt
+  Registry link the trace to that prompt version
 
 ## Quick Start
 
@@ -25,8 +35,7 @@ import synalinks
 
 # Enable FIRST, before creating any modules
 synalinks.enable_observability(
-    tracking_uri="http://localhost:5000",
-    experiment_name="my_experiment"
+    tracking_uri="http://localhost:5000", experiment_name="my_experiment"
 )
 
 # Now create your modules - they will be automatically traced
@@ -44,8 +53,7 @@ import synalinks
 
 # Enable observability before creating your program
 synalinks.enable_observability(
-    tracking_uri="http://localhost:5000",
-    experiment_name="question_answering"
+    tracking_uri="http://localhost:5000", experiment_name="question_answering"
 )
 
 
@@ -58,7 +66,7 @@ class Answer(synalinks.DataModel):
 
 
 async def main():
-    language_model = synalinks.LanguageModel(model="gemini/gemini-2.0-flash")
+    language_model = synalinks.LanguageModel(model="gemini/gemini-3.1-flash-lite-preview")
 
     # Create a simple question-answering program
     inputs = synalinks.Input(data_model=Question)
@@ -78,6 +86,7 @@ async def main():
     result = await program(Question(question="What is the capital of France?"))
     if result:
         print(result.prettify_json())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -116,8 +125,7 @@ Then configure Synalinks to use it:
 import synalinks
 
 synalinks.enable_observability(
-    tracking_uri="http://localhost:5000",
-    experiment_name="synalinks_traces"
+    tracking_uri="http://localhost:5000", experiment_name="synalinks_traces"
 )
 ```
 
@@ -212,11 +220,16 @@ Synalinks automatically categorizes spans based on module type for better visual
 
 | Module | Span Type |
 |--------|-----------|
-| `Generator`, `ChainOfThought`, `SelfCritique` | `LLM` |
+| `LanguageModel`, `DecisionModel` | `CHAT_MODEL` |
+| `EmbeddingModel` | `EMBEDDING` |
 | `FunctionCallingAgent` | `AGENT` |
 | `EmbedKnowledge`, `RetrieveKnowledge`, `UpdateKnowledge` | `RETRIEVER` |
 | `Tool` | `TOOL` |
-| Other modules | `CHAIN` |
+| Other modules (`Generator`, `ChainOfThought`, `SelfCritique`...) | `CHAIN` |
+
+A `Generator` is a `CHAIN` span wrapping the `CHAT_MODEL` span of the model it
+calls. A `DecisionModel` is called like a `LanguageModel`, so its calls
+are traced the same way.
 
 ### Span Attributes
 
@@ -232,13 +245,85 @@ Each span includes these attributes:
 | `synalinks.is_symbolic` | Whether the call was symbolic (graph building) |
 | `synalinks.duration` | Call duration in seconds |
 | `synalinks.success` | Whether the call succeeded |
-| `synalinks.cost` | LLM API cost (when available) |
+
+Model spans (`CHAT_MODEL`) also carry:
+
+| Attribute | Description |
+|-----------|-------------|
+| `mlflow.llm.model` / `mlflow.llm.provider` | The model requested (e.g. `openai/gpt-4o-mini`) and its provider |
+| `mlflow.chat.tokenUsage` | Input, output and total tokens of the call |
+| `mlflow.llm.cost` | Cost of the call in USD (`total_cost`), when known |
+| `synalinks.cache_hit` | The response came from the model's on-disk cache |
+| `synalinks.fallback` | Every attempt failed and the `fallback` model answered |
+
+Decision model spans add the model that answered and its raw answers:
+
+| Attribute / Output | Description |
+|--------------------|-------------|
+| `synalinks.response_model` | The versioned model that answered (e.g. `typesafe/jev-1.13.0` for `jev-latest`), which the cost is based on |
+| `answers` (span outputs) | The raw answers, with the probabilities and confidence the output values leave out |
 
 ### Exception Events
 
 When a module call fails, the span automatically records an exception event with:
 - `exception.type`: The exception class name
 - `exception.message`: The exception message
+
+A language or decision model call that fails every retry returns `None` rather
+than raising, so the program can carry on. Its span is still marked as failed
+(`ERROR` status, `synalinks.success` false, exception event with the last error).
+When a `fallback` model answers instead, the failed call's span only records the
+failure and `synalinks.fallback`, and the fallback call gets its own child span
+with its tokens and cost, so they are counted once.
+
+### Users and Sessions
+
+MLflow can associate traces with a user and a chat session, which is useful for
+analyzing multi-turn conversations: you can then filter the traces of one
+session in the UI and inspect what happened at each turn. MLflow reads two
+reserved metadata keys for that, `mlflow.trace.user` and `mlflow.trace.session`.
+
+Synalinks creates its spans outside of MLflow's fluent context (nested module
+calls are linked explicitly), so `mlflow.update_current_trace()` does not see
+them. Use `synalinks.trace_context()` instead: every trace started inside the
+block carries the given user and session.
+
+```python
+import synalinks
+
+synalinks.enable_observability()
+
+# ... build your program ...
+
+with synalinks.trace_context(user_id="user-123", session_id="session-123"):
+    result = await program(inputs)
+```
+
+The context is stored in a `contextvars.ContextVar`, so it is safe to set per
+request in an async server: concurrent requests each see their own value, and
+the tasks spawned inside the block (parallel branches, agent tool calls)
+inherit it. Nested blocks merge with the enclosing one, the innermost value
+winning.
+
+```python
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    with synalinks.trace_context(user_id=request.user_id, session_id=request.session_id):
+        return await program(request.messages)
+```
+
+You can also attach free-form trace `metadata` (immutable once the trace is
+logged) and `tags` (editable afterwards in the MLflow UI):
+
+```python
+with synalinks.trace_context(
+    user_id="user-123",
+    session_id="session-123",
+    metadata={"turn": "3"},
+    tags={"env": "production"},
+):
+    result = await program(inputs)
+```
 
 ### Viewing Traces
 
@@ -274,20 +359,34 @@ For fine-grained control, you can create a Monitor hook directly:
 import synalinks
 
 monitor = synalinks.hooks.Monitor(
-    tracking_uri="http://localhost:5000",
-    experiment_name="custom_experiment"
+    tracking_uri="http://localhost:5000", experiment_name="custom_experiment"
 )
 
 # Add to a specific module
-generator = synalinks.Generator(
-    data_model=Answer,
-    hooks=[monitor]
-)
+generator = synalinks.Generator(data_model=Answer, hooks=[monitor])
 ```
 
 ## Training Metrics and Artifacts
 
-The `Monitor` callback logs training metrics and program artifacts to MLflow during `fit()`.
+The `Monitor` callback logs each `fit()` run to MLflow. When `enable_observability()`
+was called it is added to every `fit()` and `evaluate()` automatically; pass one in
+`callbacks=[...]` to customize it. A training run holds:
+
+- **Metrics**, one point per epoch: the training metrics, the `val_*` validation
+  metrics, the spend of the epoch (`epoch_cost`, `epoch_tokens`, `epoch_calls`, and
+  `epoch_cost_inference` / `epoch_cost_reward` / `epoch_cost_optimizer` when non-zero),
+  the running spend of the fit (`fit_cost`, `fit_tokens`), the all-time in-process
+  spend (`total_cost`, `total_tokens`), `epoch_duration_s`, and `fit_duration_s` at the
+  end. With `log_batch_metrics=True`, batch metrics are logged as `train_batch_*` and
+  `val_batch_*` with their own step counters.
+- **Params**: the fit arguments (epochs, batch and minibatch size, validation split and
+  frequency, dataset sizes), the compile configuration (reward, metrics, optimizer and
+  its config), the program (name, class, number of modules and trainable variables)
+  and every language or embedding model reachable from the program
+  (`lm.<name>.model`, api base, sampling settings).
+- **Datasets**: the train and validation sets as MLflow dataset inputs of the run, one
+  row per sample with JSON `inputs` and `expectations` columns.
+- **The program plot**, **the program model** and **its prompts**, described below.
 
 ### Basic Usage
 
@@ -303,12 +402,7 @@ monitor = synalinks.callbacks.Monitor(
 )
 
 # Use during training
-program.fit(
-    x=train_inputs,
-    y=train_labels,
-    epochs=10,
-    callbacks=[monitor]
-)
+program.fit(x=train_inputs, y=train_labels, epochs=10, callbacks=[monitor])
 ```
 
 ### Program Plot Artifact
@@ -324,32 +418,79 @@ The plot is saved under `program_plots/` in the artifacts folder and includes:
 
 You can view the program plot in the MLflow UI under the "Artifacts" tab of your run.
 
-### Program Model Artifact
+### Program Model
 
-When `log_program_model=True` (the default), the Monitor callback saves the program's
-trainable state at the end of training. This includes:
+When `log_program_model=True` (the default), the Monitor callback logs the whole
+program (architecture and trained variables, the JSON written by `Program.save()`) as
+an MLflow **pyfunc model** wrapped in `synalinks.callbacks.SynalinksProgramModel`.
+A new model is logged every time `val_reward` improves (`reward` without validation
+data, the end of training when neither is available). Each is an MLflow 3
+**LoggedModel** version of type `synalinks_program`, linked to the training run and
+carrying the epoch metrics logged at that step, so the Versions view of the experiment
+compares them side by side; the best one is tagged `synalinks.best`. Every logged
+model is also registered in the **Model Registry** under the program's name, so
+`models:/<program name>/<version>` and registry aliases work out of the box.
 
-- **`model/state_tree.json`**: Contains all trainable variables (few-shot examples, optimized prompts, etc.)
-- **`model/model_info.json`**: Metadata about the program (name, description, number of trainable variables)
+- The model can be loaded and served anywhere `synalinks` is installed:
 
-This is useful for:
+```python
+import mlflow
 
-- Checkpointing learned parameters during optimization
-- Comparing different training runs
-- Restoring program state for inference
+model = mlflow.pyfunc.load_model(f"models:/{model_id}")
+model.predict({"question": "What is the capital of France?"})
+# [{"answer": "Paris"}]
+```
+
+or with `mlflow models serve -m models:/<model_id>`. The model's signature is derived
+from the program's input and output JSON schemas (inferred from the first training
+sample when the schema cannot be expressed). Custom `DataModel`, `Module` or `Program`
+subclasses are resolved by `Program.load()` from their import path, so the code
+declaring them only needs to be importable where the model is loaded.
+
+The model id is written into the saved program (`program._mlflow_model_id`, persisted
+by `Program.save()` under the `mlflow` key). A later `evaluate()` of that program, even
+in another process after `Program.load()`, links its metrics and traces to that model
+version and nests its run under the training run.
+
+### Prompt Registry
+
+The prompts of the program's trainable
+modules (`Generator`, `ChainOfThought`, ... every module holding an `Instructions`
+variable) are registered in the MLflow **Prompt Registry** under the name
+`<program>.<module>`. Each registered version is a chat prompt: the system turn is the
+module's prompt rendered from its optimized instructions and few-shot examples, the
+user turn holds the `{{ inputs }}` template variable, `response_format` is the module's
+output JSON schema and `model_config` its language model settings, so the version can
+be replayed in the MLflow Playground and evaluated with `mlflow.genai.evaluate()`.
+
+A new version is created at every epoch where the rendered prompt changed. Its commit
+message and `val_reward` tag record the validation reward of that epoch (the state the
+validation scored is the one registered), along with the epoch, run id, program, module
+and optimizer. At the end of training the best-scoring version receives the `best`
+alias:
+
+```python
+prompt = mlflow.genai.load_prompt("prompts:/my_program.generator@best")
+```
+
+Versions are linked to the training run, to the logged model (`prompts=` of the model,
+shown on the model page) and to every later trace of the module (`mlflow.linkedPrompts`).
 
 ### Callback Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `experiment_name` | Program name | MLflow experiment name |
-| `run_name` | Auto-generated | MLflow run name |
+| `run_name` | Program name | MLflow run name, suffixed `_train` / `_test` |
 | `tracking_uri` | Local `./mlruns` | MLflow tracking server URI |
 | `log_batch_metrics` | `False` | Log metrics at batch level |
 | `log_epoch_metrics` | `True` | Log metrics at epoch level |
 | `log_program_plot` | `True` | Save program visualization as artifact |
-| `log_program_model` | `True` | Save program trainable state as artifact |
+| `log_program_model` | `True` | Log the program as a registered MLflow model, a new version per reward improvement |
 | `tags` | `{}` | Additional tags for the run |
+| `run_id` | `None` | Existing run to resume instead of starting a new one; the step counter continues after the last logged step |
+| `resume` | `False` | Look up a run named `run_name` in the experiment and resume it, creating it the first time |
+| `log_assessments` | `True` | Log each evaluated sample's reward as a feedback assessment on its trace |
 
 ### Example with Full Configuration
 
@@ -363,31 +504,74 @@ monitor = synalinks.callbacks.Monitor(
     log_batch_metrics=True,
     log_epoch_metrics=True,
     log_program_plot=True,
-    tags={
-        "model": "gpt-4o-mini",
-        "optimizer": "RandomFewShot",
-        "dataset": "gsm8k"
-    }
+    tags={"model": "gpt-4o-mini", "optimizer": "RandomFewShot", "dataset": "gsm8k"},
 )
 
-program.fit(
-    x=train_questions,
-    y=train_answers,
-    epochs=5,
-    callbacks=[monitor]
-)
+program.fit(x=train_questions, y=train_answers, epochs=5, callbacks=[monitor])
 ```
+
+## Evaluation Results Over Time
+
+`program.evaluate()` with the `Monitor` callback logs the reward and metrics of that
+evaluation to an MLflow run. Runs without a logged model are listed in the experiment's
+**Evaluation runs** tab (`/#/experiments/<id>/evaluation-runs`), where the charts view
+compares the metrics of every evaluation. The run is tagged `mlflow.runType =
+genai_evaluate`, like the runs created by `mlflow.genai.evaluate()`, and the traces of
+the evaluated calls are linked to it. Each evaluated sample's reward is also logged as
+a `reward` feedback assessment on the sample's trace, with the ground truth as an
+`expected_output` expectation, so the run's traces can be sorted and filtered by score
+(disable with `log_assessments=False`). The run also logs `eval_cost`, `eval_tokens`,
+`eval_duration_s` and the evaluated dataset.
+
+When the evaluated program was trained with a `Monitor` (or loaded from a program saved
+after such a training), the evaluation run is nested under the training run
+(`mlflow.parentRunId`) and its metrics and traces are linked to the logged model
+version, so the Versions view shows evaluation results per model version.
+
+When `synalinks.enable_observability()` was called, a `Monitor` callback created without
+`experiment_name` uses that same experiment, so the evaluation runs appear next to the
+traces:
+
+```python
+import synalinks
+
+synalinks.enable_observability(
+    tracking_uri="http://localhost:5000", experiment_name="my_app"
+)
+
+# ... build and compile your program ...
+
+monitor = synalinks.callbacks.Monitor(run_name="eval")
+await program.evaluate(x=test_x, y=test_y, callbacks=[monitor])
+```
+
+Each `evaluate()` call creates one run, so the Evaluation runs charts show one point per
+evaluation. To draw the metrics as a curve inside a single run instead, like the epoch
+curves of `fit()`, resume the same run on every evaluation with `resume=True`: the
+callback looks up the run named `run_name` in the experiment (creating it the first
+time), and logs each evaluation at the next step. This works across processes, so a
+scheduled evaluation appends one point per execution:
+
+```python
+monitor = synalinks.callbacks.Monitor(run_name="nightly_eval", resume=True)
+await program.evaluate(x=test_x, y=test_y, callbacks=[monitor])
+```
+
+In the MLflow UI, open the run and plot the metric against its step, or against wall
+time to see the results over time. Pass `run_id` instead of `resume` to resume a
+specific run; `monitor.run_id` holds the id of the run in use.
 
 ## Combining Tracing with Training
 
-When using both `enable_observability()` and the `Monitor` callback for training, traces
-are created in different experiments depending on the context:
+When using both `enable_observability()` and the `Monitor` callback for training:
 
 1. **During program building** (symbolic calls): Traces go to the experiment specified
    in `enable_observability()`
 
 2. **During training** (`fit()`): Traces are associated with the training run and go to
-   the experiment specified in the `Monitor` callback
+   the experiment of the `Monitor` callback. When the callback has no
+   `experiment_name`, that is the experiment of `enable_observability()`, so traces and
+   runs stay together; give the callback its own `experiment_name` to keep them apart.
 
 ### Full Example
 
@@ -397,7 +581,7 @@ import synalinks
 # Enable tracing for all module calls
 synalinks.enable_observability(
     tracking_uri="http://localhost:5000",
-    experiment_name="synalinks_traces"  # Traces during setup go here
+    experiment_name="synalinks_traces",  # Traces during setup go here
 )
 
 # Create your program (symbolic traces created here)
@@ -484,3 +668,7 @@ PermissionError: [Errno 13] Permission denied: '/mlflow'
 ### Missing cost information
 
 Cost tracking requires the language model to return usage information. Ensure your LLM provider supports this feature.
+
+Decision models are billed on input tokens only, at a price known per versioned
+model. For a model missing from the built-in price table, pass `cost_per_token`
+to the `DecisionModel`.

@@ -1,9 +1,8 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
-
-from unittest.mock import MagicMock
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from synalinks.src import testing
 from synalinks.src.backend import JsonDataModel
+from synalinks.src.modules.language_models import LanguageModel
 from synalinks.src.optimizers.evolutionary_optimizer import EvolutionaryOptimizer
 from synalinks.src.optimizers.omega import OMEGA
 from synalinks.src.optimizers.optimizer import Optimizer
@@ -24,15 +23,15 @@ class EvolutionaryOptimizerTest(testing.TestCase):
         self.assertEqual(optimizer.crossover_temperature, 0.3)
         self.assertEqual(optimizer.selection, "softmax")
         self.assertEqual(optimizer.selection_temperature, 0.3)
-        self.assertEqual(optimizer.merging_rate, 0.02)
+        self.assertEqual(optimizer.merging_rate, 0.05)
         self.assertEqual(optimizer.population_size, 10)
 
     def test_init_custom_parameters(self):
         """Test initialization with custom parameters."""
-        mock_lm = MagicMock()
+        lm = LanguageModel(model="ollama/mistral")
 
         optimizer = EvolutionaryOptimizer(
-            language_model=mock_lm,
+            language_model=lm,
             mutation_temperature=0.5,
             crossover_temperature=0.7,
             selection="best",
@@ -43,7 +42,7 @@ class EvolutionaryOptimizerTest(testing.TestCase):
             description="Test evolutionary optimizer",
         )
 
-        self.assertEqual(optimizer.language_model, mock_lm)
+        self.assertIs(optimizer.language_model, lm)
         self.assertEqual(optimizer.mutation_temperature, 0.5)
         self.assertEqual(optimizer.crossover_temperature, 0.7)
         self.assertEqual(optimizer.selection, "best")
@@ -190,3 +189,135 @@ class EvolutionaryOptimizerTest(testing.TestCase):
         ]
         result = optimizer.select_candidate(candidates)
         self.assertIn(result, candidates)
+
+    def test_sampling_temperature_default(self):
+        """EvolutionaryOptimizer must inherit `sampling_temperature` from the
+        base `Optimizer`, since `Optimizer.select_variable_name_to_update`
+        reads it. Before the fix, accessing this attribute on an
+        EvolutionaryOptimizer / OMEGA instance raised AttributeError."""
+        optimizer = EvolutionaryOptimizer()
+        self.assertEqual(optimizer.sampling_temperature, 0.3)
+
+    async def test_propose_new_candidates_falls_back_to_seed_when_best_empty(
+        self,
+    ):
+        """Regression test: on the very first training step `best_candidates`
+        is still empty (it is populated later by `maybe_add_candidate`).
+        `propose_new_candidates` used to pass the resulting `None` into
+        `mutate_candidate`, which crashed downstream (e.g. OMEGA's
+        `selected_candidate.items()` in `omega.py`). It must instead fall
+        back to a random seed candidate, mirroring `on_batch_begin`.
+        """
+        seen = {}
+
+        class _RecordingOptimizer(EvolutionaryOptimizer):
+            async def mutate_candidate(
+                self,
+                step,
+                trainable_variable,
+                selected_candidate,
+                x=None,
+                y=None,
+                y_pred=None,
+                training=False,
+            ):
+                seen["selected_candidate"] = selected_candidate
+                return None
+
+            async def merge_candidate(
+                self,
+                step,
+                trainable_variable,
+                current_candidate,
+                other_candidate,
+                x=None,
+                y=None,
+                y_pred=None,
+                training=False,
+            ):
+                return None
+
+        # merging_rate=0 keeps the strategy on "mutation" regardless of epoch.
+        optimizer = _RecordingOptimizer(selection="random", merging_rate=0.0)
+
+        seed_candidate = {"prompt": "seed_prompt"}
+        trainable_variable = JsonDataModel(
+            json={
+                "seed_candidates": [seed_candidate],
+                "best_candidates": [],
+                "nb_visit": 0,
+                "cumulative_reward": 0.0,
+                "prompt": "initial",
+            },
+            schema={
+                "type": "object",
+                "properties": {
+                    "seed_candidates": {"type": "array"},
+                    "best_candidates": {"type": "array"},
+                    "nb_visit": {"type": "integer"},
+                    "cumulative_reward": {"type": "number"},
+                    "prompt": {"type": "string"},
+                },
+            },
+            name="trainable_var",
+        )
+
+        await optimizer.propose_new_candidates(
+            step=0,
+            trainable_variables=[trainable_variable],
+        )
+
+        self.assertEqual(seen.get("selected_candidate"), seed_candidate)
+
+    async def test_select_variable_name_to_update_does_not_raise(self):
+        """Regression test: `select_variable_name_to_update` on an
+        EvolutionaryOptimizer used to raise
+        `AttributeError: 'EvolutionaryOptimizer' object has no attribute
+        'sampling_temperature'`. It must now run and return a valid name."""
+        optimizer = EvolutionaryOptimizer()
+
+        class _Var:
+            def __init__(self, name, nb_visit, cumulative_reward):
+                self.name = name
+                self._d = {
+                    "nb_visit": nb_visit,
+                    "cumulative_reward": cumulative_reward,
+                }
+
+            def get(self, key):
+                return self._d[key]
+
+        variables = [
+            _Var("v0", nb_visit=1, cumulative_reward=0.5),
+            _Var("v1", nb_visit=1, cumulative_reward=0.2),
+        ]
+        name = await optimizer.select_variable_name_to_update(variables)
+        self.assertIn(name, {"v0", "v1"})
+
+
+class EvolvingStrategyTest(testing.TestCase):
+    async def test_crossover_probability_is_the_merging_rate_and_epoch_independent(self):
+        import random
+
+        from synalinks.src.optimizers.evolutionary_optimizer import EvolutionaryOptimizer
+
+        class _Evo(EvolutionaryOptimizer):
+            async def mutate_candidate(self, *a, **k):
+                return None
+
+            async def merge_candidate(self, *a, **k):
+                return None
+
+        for merging_rate in (0.0, 0.05, 0.5, 1.0):
+            optimizer = _Evo(merging_rate=merging_rate)
+            for _ in range(30):  # a long training would have saturated the old ramp
+                optimizer.increment_epochs()
+            random.seed(0)
+            n = 4000
+            crossovers = sum(
+                [
+                    (await optimizer.select_evolving_strategy()) == "crossover"
+                    for _ in range(n)
+                ]
+            )
+            self.assertAlmostEqual(crossovers / n, merging_rate, delta=0.03)

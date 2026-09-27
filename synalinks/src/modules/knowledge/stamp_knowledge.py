@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from datetime import datetime
 
@@ -32,6 +32,7 @@ class StampKnowledge(Module):
 
     def __init__(
         self,
+        *,
         name=None,
         description=None,
         trainable=False,
@@ -43,6 +44,8 @@ class StampKnowledge(Module):
         )
 
     async def _stamp(self, data_model):
+        if data_model is None:
+            return None
         timestamp = JsonDataModel(
             json={"created_at": datetime.now().isoformat()},
             schema=Stamp.get_schema(),
@@ -57,10 +60,12 @@ class StampKnowledge(Module):
     async def call(self, inputs):
         if not inputs:
             return None
-        return tree.map_structure(
-            lambda x: run_maybe_nested(self._stamp(x)),
-            inputs,
-        )
+        # Await each stamp on the current event loop (instead of running it on a
+        # transient `run_maybe_nested` thread-loop). flatten/pack mirrors
+        # `map_structure` since data models are tree leaves.
+        leaves = tree.flatten(inputs)
+        stamped = [await self._stamp(leaf) for leaf in leaves]
+        return tree.pack_sequence_as(inputs, stamped)
 
     async def compute_output_spec(self, inputs):
         def _stamp_spec(x):

@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from synalinks.src import tree
 from synalinks.src.api_export import synalinks_export
@@ -67,7 +67,9 @@ class InMask(Module):
 
     def __init__(
         self,
+        *,
         mask=None,
+        pattern=None,
         name=None,
         description=None,
         trainable=False,
@@ -79,10 +81,13 @@ class InMask(Module):
             description=description,
         )
         self.mask = mask
+        self.pattern = pattern
 
     async def call(self, inputs):
         outputs = tree.map_structure(
-            lambda x: x.in_mask(mask=self.mask),
+            lambda x: (
+                x.in_mask(mask=self.mask, pattern=self.pattern) if x is not None else x
+            ),
             inputs,
         )
         return outputs

@@ -1,10 +1,13 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend import DataModel
 from synalinks.src.backend import Field
 from synalinks.src.backend import SymbolicDataModel
 from synalinks.src.modules.core.generator import Generator
+from synalinks.src.modules.core.generator import _as_tool_list
+from synalinks.src.modules.core.generator import _tools_to_schemas
+from synalinks.src.modules.language_models import get as _get_lm
 from synalinks.src.modules.module import Module
 from synalinks.src.saving import serialization_lib
 
@@ -85,8 +88,14 @@ class ChainOfThought(Module):
         seed_instructions (list): Optional. A list of instructions to use as seed for the
             optimization. If not provided, use the default instructions as seed.
         temperature (float): Optional. The temperature for the LM call.
+        max_tokens (int): Optional. Maximum number of tokens to generate. Default
+            None (the model's own default; caps generation length when set).
+        top_p (float): Optional. The nucleus sampling probability for the LM call.
+            Default None (the model's own default).
+        top_k (int): Optional. The top-k sampling cutoff for the LM call.
+            Default None (the model's own default).
         reasoning_effort (string): Optional. The reasoning effort for the LM call
-            between ['minimal', 'low', 'medium', 'high', 'disable', 'none'].
+            between ['minimal', 'low', 'medium', 'high', 'xhigh', 'disable', 'none'].
             (Default to 'low'). If reasoning effort is none or disabled, a thinking
             field is automatically added to the output data model. Otherwise,
             the thinking field is automatically populated by the model's
@@ -97,6 +106,16 @@ class ChainOfThought(Module):
             the prompt (Default to False) (see `Generator`).
         return_inputs (bool): Optional. Whether or not to concatenate the inputs to
             the outputs (Default to False) (see `Generator`).
+        streaming (bool): Optional. If true, stream the LM response. Only takes
+            effect when `data_model`/`schema` is `None` (Default to False).
+        tools (list): Optional. Live `synalinks.modules.Tool` objects (or a
+            `{name: Tool}` mapping) the underlying `Generator` always exposes,
+            merged with any passed to `call`. Serialized as `tool_schemas`
+            (see `Generator`).
+        tool_schemas (list): Optional. Already-wire-formatted tool declaration
+            dicts (OpenAI `{"type": "function", ...}` shape) the underlying
+            `Generator` always exposes, merged with any passed to `call`
+            (see `Generator`).
         name (str): Optional. The name of the module.
         description (str): Optional. The description of the module.
         trainable (bool): Whether the module's variables should be trainable.
@@ -104,18 +123,26 @@ class ChainOfThought(Module):
 
     def __init__(
         self,
+        *,
         schema=None,
         data_model=None,
         language_model=None,
         prompt_template=None,
+        prompt_variables=None,
         examples=None,
         instructions=None,
         seed_instructions=None,
-        temperature=0.0,
+        temperature=None,
+        max_tokens=None,
+        top_p=None,
+        top_k=None,
         reasoning_effort=None,
         use_inputs_schema=False,
         use_outputs_schema=False,
         return_inputs=False,
+        streaming=False,
+        tools=None,
+        tool_schemas=None,
         name=None,
         description=None,
         trainable=True,
@@ -129,12 +156,16 @@ class ChainOfThought(Module):
         if not schema and data_model:
             schema = data_model.get_schema()
         self.schema = schema
-        self.language_model = language_model
+        self.language_model = _get_lm(language_model)
         self.prompt_template = prompt_template
+        self.prompt_variables = dict(prompt_variables or {})
         self.examples = examples
         self.instructions = instructions
         self.seed_instructions = seed_instructions
         self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.top_k = top_k
         # Default to "low" reasoning effort for ChainOfThought
         if reasoning_effort is None:
             reasoning_effort = "low"
@@ -142,39 +173,68 @@ class ChainOfThought(Module):
         self.use_inputs_schema = use_inputs_schema
         self.use_outputs_schema = use_outputs_schema
         self.return_inputs = return_inputs
+        # Streaming is only meaningful when there is no structured schema.
+        if self.schema and streaming:
+            streaming = False
+        self.streaming = streaming
+        self.tools = _as_tool_list(tools)
+        self.tool_schemas = tool_schemas
 
-        final_data_model = Thinking + SymbolicDataModel(schema=self.schema)
+        if self.schema:
+            final_data_model = Thinking + SymbolicDataModel(schema=self.schema)
+        else:
+            final_data_model = None
 
         self.generator = Generator(
             data_model=final_data_model,
             language_model=self.language_model,
             prompt_template=self.prompt_template,
+            prompt_variables=self.prompt_variables,
             examples=self.examples,
             instructions=self.instructions,
             seed_instructions=self.seed_instructions,
             temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            top_p=self.top_p,
+            top_k=self.top_k,
             reasoning_effort=self.reasoning_effort,
             use_inputs_schema=self.use_inputs_schema,
             use_outputs_schema=self.use_outputs_schema,
             return_inputs=self.return_inputs,
+            streaming=self.streaming,
+            tools=self.tools,
+            tool_schemas=self.tool_schemas,
             name="generator_" + self.name,
         )
 
-    async def call(self, inputs, training=False):
-        return await self.generator(inputs, training=training)
+    async def call(self, inputs, tools=None, tool_schemas=None, training=False):
+        return await self.generator(
+            inputs, tools=tools, tool_schemas=tool_schemas, training=training
+        )
 
     def get_config(self):
         config = {
             "schema": self.schema,
             "prompt_template": self.prompt_template,
+            "prompt_variables": self.prompt_variables,
             "examples": self.examples,
             "instructions": self.instructions,
             "seed_instructions": self.seed_instructions,
             "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
             "reasoning_effort": self.reasoning_effort,
             "use_inputs_schema": self.use_inputs_schema,
             "use_outputs_schema": self.use_outputs_schema,
             "return_inputs": self.return_inputs,
+            "streaming": self.streaming,
+            # Live `tools` are serialized as their wire form alongside
+            # `tool_schemas` (the way `data_model` is stored as `schema`).
+            "tool_schemas": (
+                list(self.tool_schemas or []) + _tools_to_schemas(self.tools)
+            )
+            or None,
             "name": self.name,
             "description": self.description,
             "trainable": self.trainable,

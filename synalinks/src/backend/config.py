@@ -1,11 +1,12 @@
 # Modified from: keras/src/backend/config.py
 # Original authors: François Chollet et al. (Keras Team)
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import logging
 import os
 import random
 import re
+import tempfile
 
 import numpy as np
 import orjson
@@ -36,6 +37,31 @@ _MLFLOW_TRACKING_URI = None
 # MLflow experiment name for observability
 _MLFLOW_EXPERIMENT_NAME = "synalinks_traces"
 
+# Enable trace recording (LM calls written to JSONL files)
+_ENABLE_TRACE_RECORDING = False
+
+# Root folder where the trace records are written.
+# None means `synalinks_home()` (resolved at call time).
+_TRACE_RECORDING_DIR = None
+
+# Default language model (cached instance) and the identifier to persist.
+# The instance is materialized lazily because language_models depends on
+# modules which depends on backend.
+_DEFAULT_LANGUAGE_MODEL = None
+_DEFAULT_LANGUAGE_MODEL_IDENTIFIER = None
+
+# Default embedding model (same shape as language model above).
+_DEFAULT_EMBEDDING_MODEL = None
+_DEFAULT_EMBEDDING_MODEL_IDENTIFIER = None
+
+# Default decision model (same shape as language model above).
+_DEFAULT_DECISION_MODEL = None
+_DEFAULT_DECISION_MODEL_IDENTIFIER = None
+
+# Default knowledge base (same shape as language model above).
+_DEFAULT_KNOWLEDGE_BASE = None
+_DEFAULT_KNOWLEDGE_BASE_IDENTIFIER = None
+
 # Available backends
 _AVAILABLE_BACKEND = ["pydantic"]
 
@@ -56,13 +82,13 @@ class SynalinksLogFormatter(logging.Formatter):
     blue = "\x1b[34m"
     bold_red = "\x1b[31;1m"
     reset = "\x1b[0m"
-    prefix = "🧠🔗 Synalinks: "
+    prefix = "[Synalinks]"
 
     FORMATS = {
         logging.DEBUG: f"(DEBUG) {prefix}%(message)s",
         logging.INFO: f"{prefix}%(message)s",
         logging.WARNING: f"{prefix}%(message)s",
-        logging.ERROR: f"{bold_red}{prefix}%(message)s{reset}",
+        logging.ERROR: f"{bold_red}%(message)s{reset}",
         logging.CRITICAL: f"{bold_red}{prefix}%(message)s{reset}",
     }
 
@@ -80,32 +106,6 @@ class SynalinksFileFormatter(logging.Formatter):
     def format(self, record):
         record.msg = self.ANSI_ESCAPE_PATTERN.sub("", str(record.msg))
         return super().format(record)
-
-
-_ENABLE_TELEMETRY = True
-
-
-@synalinks_export(
-    [
-        "synalinks.config.disable_telemetry",
-        "synalinks.backend.disable_telemetry",
-        "synalinks.disable_telemetry",
-    ]
-)
-def disable_telemetry():
-    global _ENABLE_TELEMETRY
-    _ENABLE_TELEMETRY = False
-
-
-@synalinks_export(
-    [
-        "synalinks.config.is_telemetry_enabled",
-        "synalinks.backend.is_telemetry_enabled",
-        "synalinks.is_telemetry_enabled",
-    ]
-)
-def is_telemetry_enabled():
-    return _ENABLE_TELEMETRY
 
 
 @synalinks_export(["synalinks.config.floatx", "synalinks.backend.floatx"])
@@ -355,7 +355,10 @@ def enable_observability(tracking_uri=None, experiment_name=None):
     Configures and enables observability for the application using MLflow.
 
     This function sets up the observability configuration for the application,
-    enabling tracing of module calls via MLflow.
+    enabling tracing of module calls via MLflow (the `Monitor` hook) and the
+    logging of every `fit()` / `evaluate()` run (the `Monitor` callback, added
+    automatically): metrics, params, datasets, the trained program as a
+    registered MLflow model and its prompts in the Prompt Registry.
 
     Args:
         tracking_uri (str): Optional. The MLflow tracking server URI.
@@ -363,7 +366,6 @@ def enable_observability(tracking_uri=None, experiment_name=None):
             directory or MLFLOW_TRACKING_URI environment variable).
         experiment_name (str): Optional. The MLflow experiment name.
             Defaults to "synalinks_traces".
-
     Example:
 
     ```python
@@ -388,6 +390,82 @@ def enable_observability(tracking_uri=None, experiment_name=None):
     if experiment_name:
         _MLFLOW_EXPERIMENT_NAME = experiment_name
     _ENABLE_OBSERVABILITY = True
+
+
+@synalinks_export(
+    [
+        "synalinks.config.is_trace_recording_enabled",
+        "synalinks.backend.is_trace_recording_enabled",
+        "synalinks.is_trace_recording_enabled",
+    ]
+)
+def is_trace_recording_enabled():
+    """Check if the trace recording is enabled
+
+    Returns:
+        (bool): True if the trace recording is enabled.
+    """
+    return _ENABLE_TRACE_RECORDING
+
+
+@synalinks_export(
+    [
+        "synalinks.config.record_traces",
+        "synalinks.backend.record_traces",
+        "synalinks.record_traces",
+    ]
+)
+def record_traces(base_dir=None):
+    """Enables trace recording of `LanguageModel` calls.
+
+    This function enables the `Recorder` hook for every module, recording
+    each LM call (chat messages, completion, token usage, cost ...) as one
+    JSON line under `base_dir`, organized as one folder per program and one
+    subfolder per originating module. Useful to collect training data.
+
+    Call it at the beginning of your scripts, before creating your modules.
+
+    Args:
+        base_dir (str): Optional. The root folder where the records are
+            written. If not provided, uses `synalinks_home()`
+            (`$SYNALINKS_HOME` or `~/.synalinks`).
+
+    Example:
+
+    ```python
+    import synalinks
+
+    # Basic usage: records under ~/.synalinks
+    synalinks.record_traces()
+
+    # With a custom folder
+    synalinks.record_traces(base_dir="./traces")
+    ```
+    """
+    global _ENABLE_TRACE_RECORDING
+    global _TRACE_RECORDING_DIR
+
+    if base_dir:
+        _TRACE_RECORDING_DIR = base_dir
+    _ENABLE_TRACE_RECORDING = True
+
+
+@synalinks_export(
+    [
+        "synalinks.config.trace_recording_dir",
+        "synalinks.backend.trace_recording_dir",
+    ]
+)
+def trace_recording_dir():
+    """Returns the root folder where the trace records are written.
+
+    Returns:
+        (str): The folder set via `record_traces()`, or
+            `synalinks_home()` if none was set.
+    """
+    if _TRACE_RECORDING_DIR:
+        return _TRACE_RECORDING_DIR
+    return synalinks_home()
 
 
 @synalinks_export(
@@ -475,14 +553,234 @@ def set_api_key(key):
 
 
 # Set synalinks base dir path given synalinks_HOME env variable, if applicable.
-# Otherwise either ~/.synalinks or /tmp.
+# Otherwise either ~/.synalinks or, when home isn't writable, the system temp dir.
 if "SYNALINKS_HOME" in os.environ:
     _synalinks_DIR = os.environ.get("SYNALINKS_HOME")
 else:
     _synalinks_base_dir = os.path.expanduser("~")
     if not os.access(_synalinks_base_dir, os.W_OK):
-        _synalinks_base_dir = "/tmp"
+        _synalinks_base_dir = tempfile.gettempdir()
     _synalinks_DIR = os.path.join(_synalinks_base_dir, ".synalinks")
+
+
+@synalinks_export(
+    [
+        "synalinks.config.default_language_model",
+        "synalinks.default_language_model",
+    ]
+)
+def default_language_model():
+    """Return the default `LanguageModel` instance, or `None` if unset.
+
+    The instance is constructed lazily on first call when set from a
+    persisted identifier (e.g. via `~/.synalinks/synalinks.json`).
+    """
+    global _DEFAULT_LANGUAGE_MODEL
+    if _DEFAULT_LANGUAGE_MODEL is None and _DEFAULT_LANGUAGE_MODEL_IDENTIFIER is not None:
+        from synalinks.src.modules.language_models import get as _get_lm
+
+        _DEFAULT_LANGUAGE_MODEL = _get_lm(_DEFAULT_LANGUAGE_MODEL_IDENTIFIER)
+    return _DEFAULT_LANGUAGE_MODEL
+
+
+@synalinks_export(
+    [
+        "synalinks.config.set_default_language_model",
+        "synalinks.set_default_language_model",
+    ]
+)
+def set_default_language_model(identifier: "str | dict | object | None"):
+    """Set the default `LanguageModel`.
+
+    Args:
+        identifier (str | dict | LanguageModel | None): A model string
+            (e.g. `"openai/gpt-4o-mini"`), a config dict, an existing
+            `LanguageModel` instance, or `None` to clear. Strings persist
+            into the on-disk config; instances do not.
+    """
+    global _DEFAULT_LANGUAGE_MODEL, _DEFAULT_LANGUAGE_MODEL_IDENTIFIER
+    if identifier is None:
+        _DEFAULT_LANGUAGE_MODEL = None
+        _DEFAULT_LANGUAGE_MODEL_IDENTIFIER = None
+        _persist_config()
+        return
+    from synalinks.src.modules.language_models import get as _get_lm
+
+    _DEFAULT_LANGUAGE_MODEL = _get_lm(identifier)
+    _DEFAULT_LANGUAGE_MODEL_IDENTIFIER = (
+        identifier if isinstance(identifier, str) else None
+    )
+    _persist_config()
+
+
+@synalinks_export(
+    [
+        "synalinks.config.default_embedding_model",
+        "synalinks.default_embedding_model",
+    ]
+)
+def default_embedding_model():
+    """Return the default `EmbeddingModel` instance, or `None` if unset."""
+    global _DEFAULT_EMBEDDING_MODEL
+    if (
+        _DEFAULT_EMBEDDING_MODEL is None
+        and _DEFAULT_EMBEDDING_MODEL_IDENTIFIER is not None
+    ):
+        from synalinks.src.modules.embedding_models import get as _get_em
+
+        _DEFAULT_EMBEDDING_MODEL = _get_em(_DEFAULT_EMBEDDING_MODEL_IDENTIFIER)
+    return _DEFAULT_EMBEDDING_MODEL
+
+
+@synalinks_export(
+    [
+        "synalinks.config.set_default_embedding_model",
+        "synalinks.set_default_embedding_model",
+    ]
+)
+def set_default_embedding_model(identifier: "str | dict | object | None"):
+    """Set the default `EmbeddingModel`.
+
+    Args:
+        identifier (str | dict | EmbeddingModel | None): A model string
+            (e.g. `"openai/text-embedding-3-small"`), a config dict, an
+            existing `EmbeddingModel` instance, or `None` to clear.
+            Strings persist into the on-disk config; instances do not.
+    """
+    global _DEFAULT_EMBEDDING_MODEL, _DEFAULT_EMBEDDING_MODEL_IDENTIFIER
+    if identifier is None:
+        _DEFAULT_EMBEDDING_MODEL = None
+        _DEFAULT_EMBEDDING_MODEL_IDENTIFIER = None
+        _persist_config()
+        return
+    from synalinks.src.modules.embedding_models import get as _get_em
+
+    _DEFAULT_EMBEDDING_MODEL = _get_em(identifier)
+    _DEFAULT_EMBEDDING_MODEL_IDENTIFIER = (
+        identifier if isinstance(identifier, str) else None
+    )
+    _persist_config()
+
+
+@synalinks_export(
+    [
+        "synalinks.config.default_decision_model",
+        "synalinks.default_decision_model",
+    ]
+)
+def default_decision_model():
+    """Return the default `DecisionModel` instance, or `None` if unset."""
+    global _DEFAULT_DECISION_MODEL
+    if _DEFAULT_DECISION_MODEL is None and _DEFAULT_DECISION_MODEL_IDENTIFIER is not None:
+        from synalinks.src.modules.decision_models import get as _get_dm
+
+        _DEFAULT_DECISION_MODEL = _get_dm(_DEFAULT_DECISION_MODEL_IDENTIFIER)
+    return _DEFAULT_DECISION_MODEL
+
+
+@synalinks_export(
+    [
+        "synalinks.config.set_default_decision_model",
+        "synalinks.set_default_decision_model",
+    ]
+)
+def set_default_decision_model(identifier: "str | dict | object | None"):
+    """Set the default `DecisionModel`.
+
+    Args:
+        identifier (str | dict | DecisionModel | None): A model string
+            (e.g. `"typesafe/jev-latest"`), a config dict, an existing
+            `DecisionModel` instance, or `None` to clear. Strings persist
+            into the on-disk config; instances do not.
+    """
+    global _DEFAULT_DECISION_MODEL, _DEFAULT_DECISION_MODEL_IDENTIFIER
+    if identifier is None:
+        _DEFAULT_DECISION_MODEL = None
+        _DEFAULT_DECISION_MODEL_IDENTIFIER = None
+        _persist_config()
+        return
+    from synalinks.src.modules.decision_models import get as _get_dm
+
+    _DEFAULT_DECISION_MODEL = _get_dm(identifier)
+    _DEFAULT_DECISION_MODEL_IDENTIFIER = (
+        identifier if isinstance(identifier, str) else None
+    )
+    _persist_config()
+
+
+@synalinks_export(
+    [
+        "synalinks.config.default_knowledge_base",
+        "synalinks.default_knowledge_base",
+    ]
+)
+def default_knowledge_base():
+    """Return the default `KnowledgeBase` instance, or `None` if unset."""
+    global _DEFAULT_KNOWLEDGE_BASE
+    if _DEFAULT_KNOWLEDGE_BASE is None and _DEFAULT_KNOWLEDGE_BASE_IDENTIFIER is not None:
+        from synalinks.src.knowledge_bases import get as _get_kb
+
+        _DEFAULT_KNOWLEDGE_BASE = _get_kb(_DEFAULT_KNOWLEDGE_BASE_IDENTIFIER)
+    return _DEFAULT_KNOWLEDGE_BASE
+
+
+@synalinks_export(
+    [
+        "synalinks.config.set_default_knowledge_base",
+        "synalinks.set_default_knowledge_base",
+    ]
+)
+def set_default_knowledge_base(identifier: "str | dict | object | None"):
+    """Set the default `KnowledgeBase`.
+
+    Args:
+        identifier (str | dict | KnowledgeBase | None): A URI string
+            (e.g. `"duckdb://./my_database.db"`), a config dict, an
+            existing `KnowledgeBase` instance, or `None` to clear.
+            Strings persist into the on-disk config; instances do not.
+    """
+    global _DEFAULT_KNOWLEDGE_BASE, _DEFAULT_KNOWLEDGE_BASE_IDENTIFIER
+    if identifier is None:
+        _DEFAULT_KNOWLEDGE_BASE = None
+        _DEFAULT_KNOWLEDGE_BASE_IDENTIFIER = None
+        _persist_config()
+        return
+    from synalinks.src.knowledge_bases import get as _get_kb
+
+    _DEFAULT_KNOWLEDGE_BASE = _get_kb(identifier)
+    _DEFAULT_KNOWLEDGE_BASE_IDENTIFIER = (
+        identifier if isinstance(identifier, str) else None
+    )
+    _persist_config()
+
+
+def _persist_config():
+    """Rewrite `~/.synalinks/synalinks.json` with the current config."""
+    if not os.path.exists(_synalinks_DIR):
+        try:
+            os.makedirs(_synalinks_DIR)
+        except OSError:
+            return
+    payload = {
+        "backend": _BACKEND,
+        "floatx": _FLOATX,
+        "epsilon": _EPSILON,
+        "seed": _RANDOM_SEED,
+        "api_base": _SYNALINKS_API_BASE,
+    }
+    if _DEFAULT_LANGUAGE_MODEL_IDENTIFIER is not None:
+        payload["language_model"] = _DEFAULT_LANGUAGE_MODEL_IDENTIFIER
+    if _DEFAULT_EMBEDDING_MODEL_IDENTIFIER is not None:
+        payload["embedding_model"] = _DEFAULT_EMBEDDING_MODEL_IDENTIFIER
+    if _DEFAULT_DECISION_MODEL_IDENTIFIER is not None:
+        payload["decision_model"] = _DEFAULT_DECISION_MODEL_IDENTIFIER
+    if _DEFAULT_KNOWLEDGE_BASE_IDENTIFIER is not None:
+        payload["knowledge_base"] = _DEFAULT_KNOWLEDGE_BASE_IDENTIFIER
+    try:
+        with open(_config_path, "wb") as f:
+            f.write(orjson.dumps(payload, option=orjson.OPT_INDENT_2))
+    except IOError:
+        pass
 
 
 @synalinks_export(["synalinks.config.synalinks_home", "synalinks.synalinks_home"])
@@ -551,26 +849,26 @@ if os.path.exists(_config_path):
     set_seed(_seed)
     set_api_base(_SYNALINKS_API_BASE)
 
-# Save config file, if possible.
-if not os.path.exists(_synalinks_DIR):
-    try:
-        os.makedirs(_synalinks_DIR)
-    except OSError:
-        # Except permission denied and potential race conditions
-        # in multi-threaded environments.
-        pass
+    # Default LM/Embedding identifiers are stored as strings; the cached
+    # instances are materialized lazily on first `default_*_model()` call
+    # because `language_models`/`embedding_models` aren't loaded yet.
+    _lm_identifier = _config.get("language_model")
+    if _lm_identifier is not None:
+        assert isinstance(_lm_identifier, str)
+        _DEFAULT_LANGUAGE_MODEL_IDENTIFIER = _lm_identifier
+    _em_identifier = _config.get("embedding_model")
+    if _em_identifier is not None:
+        assert isinstance(_em_identifier, str)
+        _DEFAULT_EMBEDDING_MODEL_IDENTIFIER = _em_identifier
+    _dm_identifier = _config.get("decision_model")
+    if _dm_identifier is not None:
+        assert isinstance(_dm_identifier, str)
+        _DEFAULT_DECISION_MODEL_IDENTIFIER = _dm_identifier
+    _kb_identifier = _config.get("knowledge_base")
+    if _kb_identifier is not None:
+        assert isinstance(_kb_identifier, str)
+        _DEFAULT_KNOWLEDGE_BASE_IDENTIFIER = _kb_identifier
 
+# Save config file with current values, creating the directory if needed.
 if not os.path.exists(_config_path):
-    _config = {
-        "backend": _BACKEND,
-        "floatx": _FLOATX,
-        "epsilon": _EPSILON,
-        "seed": _RANDOM_SEED,
-        "api_base": _SYNALINKS_API_BASE,
-    }
-    try:
-        with open(_config_path, "wb") as f:
-            f.write(orjson.dumps(_config, option=orjson.OPT_INDENT_2))
-    except IOError:
-        # Except permission denied.
-        pass
+    _persist_config()

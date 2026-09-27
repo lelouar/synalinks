@@ -1,0 +1,804 @@
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
+
+import asyncio
+import importlib.util
+import shutil
+import sys
+import tempfile
+import types
+
+from synalinks.src import testing
+from synalinks.src.callbacks.history import History as SynalinksHistory
+from synalinks.src.utils import keras_tuner_utils
+from synalinks.src.utils.keras_backend import disable_keras_backend
+from synalinks.src.utils.keras_tuner_utils import BayesianOptimization
+from synalinks.src.utils.keras_tuner_utils import GridSearch
+from synalinks.src.utils.keras_tuner_utils import Hyperband
+from synalinks.src.utils.keras_tuner_utils import Objective
+from synalinks.src.utils.keras_tuner_utils import RandomSearch
+from synalinks.src.utils.keras_tuner_utils import _history_to_metrics_dict
+from synalinks.src.utils.keras_tuner_utils import _objective_directions
+
+
+def _is_managed_module(name: str) -> bool:
+    return (
+        name == "keras"
+        or name.startswith("keras.")
+        or name == "keras_tuner"
+        or name.startswith("keras_tuner.")
+    )
+
+
+class StubExportTest(testing.TestCase):
+    """The stub classes that get decorated with `@synalinks_export` and
+    discovered by the API generator. They must:
+
+      - exist as module-level symbols (so namex finds them),
+      - carry the `_api_export_path` attribute set by the decorator,
+      - resolve to the right path, and
+      - NOT pull in `keras_tuner` simply by being imported.
+    """
+
+    def test_stub_classes_are_module_level(self):
+        for sym in (RandomSearch, BayesianOptimization, Hyperband, GridSearch):
+            self.assertTrue(callable(sym))
+            self.assertEqual(sym.__module__, keras_tuner_utils.__name__)
+
+    def test_stub_class_names_round_trip(self):
+        self.assertEqual(RandomSearch.__name__, "RandomSearch")
+        self.assertEqual(BayesianOptimization.__name__, "BayesianOptimization")
+        self.assertEqual(Hyperband.__name__, "Hyperband")
+        self.assertEqual(GridSearch.__name__, "GridSearch")
+
+    def test_importing_module_does_not_load_keras_tuner(self):
+        """Critical: `keras_tuner` must remain lazy.
+
+        Otherwise the api auto-import path (`synalinks/api/tuners/__init__.py`
+        is loaded eagerly from `synalinks/__init__.py`) would force every
+        synalinks user to have keras-tuner installed.
+
+        We can't reliably *unload* kt for this test, so instead we re-import
+        a fresh copy of `keras_tuner_utils` after stripping kt from
+        `sys.modules`, and confirm the stub access alone does not reload it.
+        """
+        saved = {
+            name: sys.modules.pop(name)
+            for name in list(sys.modules)
+            if _is_managed_module(name)
+        }
+        try:
+            sys.modules.pop("synalinks.src.utils.keras_tuner_utils", None)
+            spec = importlib.util.find_spec("synalinks.src.utils.keras_tuner_utils")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            self.assertNotIn(
+                "keras_tuner",
+                sys.modules,
+                "Importing `keras_tuner_utils` must not import keras_tuner.",
+            )
+            # Touching the symbol on the module is still lazy: only
+            # instantiation triggers the kt import.
+            _ = mod.RandomSearch
+            self.assertNotIn("keras_tuner", sys.modules)
+        finally:
+            for name in list(sys.modules):
+                if _is_managed_module(name):
+                    sys.modules.pop(name, None)
+            for name, m in saved.items():
+                sys.modules[name] = m
+
+    def test_export_decorator_registered_paths(self):
+        """`@synalinks_export` should have routed each stub to the tuners ns."""
+        from synalinks.src.api_export import REGISTERED_NAMES_TO_OBJS
+
+        for name in ("RandomSearch", "BayesianOptimization", "Hyperband", "GridSearch"):
+            path = f"synalinks.tuners.{name}"
+            self.assertIn(path, REGISTERED_NAMES_TO_OBJS, f"Missing export: {path}")
+
+
+class HistoryReductionTest(testing.TestCase):
+    """`_history_to_metrics_dict` is the bit we own; keras-tuner doesn't
+    know how to unwrap a synalinks History on its own."""
+
+    def _make_history(self, history_dict):
+        h = SynalinksHistory()
+        h.history = history_dict
+        return h
+
+    def test_single_objective_max_picks_max_across_epochs(self):
+        history = self._make_history(
+            {
+                "reward": [0.1, 0.7, 0.4],
+                "val_reward": [0.2, 0.5, 0.9],
+            }
+        )
+        obj = types.SimpleNamespace(name="val_reward", direction="max")
+        result = _history_to_metrics_dict(history, obj)
+        self.assertEqual(result["val_reward"], 0.9)
+        # Non-objective metrics use the *last* value, not the best.
+        self.assertEqual(result["reward"], 0.4)
+
+    def test_single_objective_min_picks_min_across_epochs(self):
+        history = self._make_history({"loss": [1.0, 0.3, 0.6]})
+        obj = types.SimpleNamespace(name="loss", direction="min")
+        result = _history_to_metrics_dict(history, obj)
+        self.assertEqual(result["loss"], 0.3)
+
+    def test_multi_objective_reduces_each_metric_in_its_own_direction(self):
+        history = self._make_history(
+            {
+                "loss": [1.0, 0.4, 0.5],
+                "reward": [0.2, 0.9, 0.7],
+            }
+        )
+        # MultiObjective exposes `name_to_direction` directly.
+        multi = types.SimpleNamespace(
+            name_to_direction={"loss": "min", "reward": "max"},
+        )
+        result = _history_to_metrics_dict(history, multi)
+        self.assertEqual(result["loss"], 0.4)
+        self.assertEqual(result["reward"], 0.9)
+
+    def test_empty_metric_lists_are_skipped(self):
+        history = self._make_history({"reward": [], "val_reward": [0.5]})
+        obj = types.SimpleNamespace(name="val_reward", direction="max")
+        result = _history_to_metrics_dict(history, obj)
+        self.assertNotIn("reward", result)
+        self.assertEqual(result["val_reward"], 0.5)
+
+    def test_objective_directions_handles_default_objective(self):
+        # kt's `DefaultObjective` has name="default_objective", direction="min".
+        default = types.SimpleNamespace(name="default_objective", direction="min")
+        directions = _objective_directions(default)
+        self.assertEqual(directions, {"default_objective": "min"})
+
+
+class ResolveErrorTest(testing.TestCase):
+    """When `keras_tuner` can't be imported, the message should tell the
+    user exactly what to fix (call `disable_keras_backend()` or install
+    keras-tuner)."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved = {
+            name: sys.modules.pop(name)
+            for name in list(sys.modules)
+            if _is_managed_module(name)
+        }
+        # Clear the resolved-class cache so each test re-runs the resolver.
+        self._cache_backup = dict(keras_tuner_utils._REAL_SUBCLASSES)
+        keras_tuner_utils._REAL_SUBCLASSES.clear()
+
+    def tearDown(self):
+        keras_tuner_utils._REAL_SUBCLASSES.clear()
+        keras_tuner_utils._REAL_SUBCLASSES.update(self._cache_backup)
+        for name in list(sys.modules):
+            if _is_managed_module(name):
+                sys.modules.pop(name, None)
+        for name, m in self._saved.items():
+            sys.modules[name] = m
+        super().tearDown()
+
+    def test_missing_keras_backend_message_points_at_disable_keras_backend(self):
+        """Without Keras and without the stub, kt fails to import. The
+        wrapped error must mention `disable_keras_backend` so the user
+        knows the remediation. Either `RuntimeError` (keras/keras_tuner
+        missing after a clean import attempt) or `ImportError` (kt itself
+        not installed) is acceptable here: both bodies point the user at
+        the same fix path."""
+        with self.assertRaises((RuntimeError, ImportError)) as ctx:
+            RandomSearch()  # triggers _resolve_kt_tuner
+        msg = str(ctx.exception)
+        self.assertTrue(
+            "disable_keras_backend" in msg or "keras-tuner" in msg,
+            f"Unhelpful error message: {msg!r}",
+        )
+
+    def test_resolved_subclass_is_cached(self):
+        """Repeated instantiation must not re-build the kt subclass."""
+        disable_keras_backend()
+        try:
+            import keras_tuner  # noqa: F401
+        except Exception:
+            self.skipTest("keras_tuner is not importable in this env")
+        cls_1 = keras_tuner_utils._resolve_kt_tuner("RandomSearch")
+        cls_2 = keras_tuner_utils._resolve_kt_tuner("RandomSearch")
+        self.assertIs(cls_1, cls_2)
+
+
+class TunerEndToEndTest(testing.TestCase):
+    """Drive a real `kt.RandomSearch` through `tuner.search()` with a fake
+    synalinks Program. We mock `program.fit` to return a synthetic History
+    so the test runs offline (no LM)."""
+
+    def setUp(self):
+        super().setUp()
+        # `find_spec` interacts oddly with pytest's collection (it returns
+        # `None` here even when `keras_tuner` is importable in a fresh
+        # interpreter). Probe by actually attempting an import instead.
+        from synalinks.src.utils.keras_backend import disable_keras_backend
+
+        disable_keras_backend()
+        try:
+            import keras_tuner  # noqa: F401
+        except Exception as e:
+            self.skipTest(f"keras_tuner is not importable: {type(e).__name__}: {e}")
+        self._saved = {
+            name: sys.modules.pop(name)
+            for name in list(sys.modules)
+            if _is_managed_module(name)
+        }
+        keras_tuner_utils._REAL_SUBCLASSES.clear()
+        self._tmpdir = tempfile.mkdtemp(prefix="synalinks_kt_test_")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        keras_tuner_utils._REAL_SUBCLASSES.clear()
+        for name in list(sys.modules):
+            if _is_managed_module(name):
+                sys.modules.pop(name, None)
+        for name, m in self._saved.items():
+            sys.modules[name] = m
+        super().tearDown()
+
+    def _build_fake_program_factory(self):
+        """Return a hypermodel callable + the list of HP values it saw."""
+        seen = []
+
+        async def build(hp):
+            x = hp.Float("x", 0.0, 1.0)
+            seen.append(x)
+
+            class _FakeProgram:
+                optimizer = object()  # truthy → dispatch to fit() branch
+
+                async def fit(self_inner, *args, **kwargs):
+                    # Reward peaks at x=0.3; RandomSearch with enough trials
+                    # should converge near that.
+                    score = 1.0 - abs(x - 0.3)
+                    h = SynalinksHistory()
+                    h.history = {"val_reward": [score]}
+                    return h
+
+            return _FakeProgram()
+
+        return build, seen
+
+    def test_random_search_drives_fake_synalinks_program_via_fit(self):
+        disable_keras_backend()
+        build, seen = self._build_fake_program_factory()
+
+        tuner = RandomSearch(
+            hypermodel=build,
+            objective=Objective("val_reward", direction="max"),
+            max_trials=10,
+            directory=self._tmpdir,
+            project_name="fake_program_fit",
+            overwrite=True,
+            seed=42,
+        )
+        # The space is explored once at construction (`_populate_initial_space`)
+        # and then once per trial, so the hypermodel runs `1 + max_trials` times.
+        self.assertEqual(
+            len(seen), 1, "hypermodel should run once to explore the space at init"
+        )
+
+        # Args go through to `program.fit(...)`. Our fake ignores them.
+        tuner.search(epochs=1)
+
+        self.assertEqual(
+            len(seen), 11, "hypermodel should run once per trial after the init build"
+        )
+        best = tuner.get_best_hyperparameters(num_trials=1)[0]
+        # 10 random samples in [0, 1]; best x should land near 0.3.
+        self.assertLess(abs(best.get("x") - 0.3), 0.3)
+
+    def test_search_runs_all_trials_on_one_event_loop(self):
+        # Regression: each trial used to run via `run_maybe_nested`, which
+        # creates AND closes a fresh event loop per trial. That stranded
+        # litellm's module-level async client on a closed loop every trial
+        # (the "Event loop is closed" flood + wedged process exit). `search()`
+        # now runs the whole search on a single loop.
+        disable_keras_backend()
+        build, _ = self._build_fake_program_factory()
+        tuner = RandomSearch(
+            hypermodel=build,
+            objective=Objective("val_reward", direction="max"),
+            max_trials=5,
+            directory=self._tmpdir,
+            project_name="one_loop",
+            overwrite=True,
+            seed=42,
+        )
+        real_new = asyncio.new_event_loop
+        created = []
+
+        def counting():
+            loop = real_new()
+            created.append(loop)
+            return loop
+
+        asyncio.new_event_loop = counting
+        try:
+            tuner.search(epochs=1)
+        finally:
+            asyncio.new_event_loop = real_new
+
+        self.assertEqual(
+            len(created),
+            1,
+            f"search() should create exactly one event loop for all trials, "
+            f"got {len(created)}",
+        )
+
+    def _build_failing_program_factory(self):
+        """Hypermodel whose `fit` always raises, so every trial fails and
+        keras_tuner aborts with its consecutive-failure RuntimeError."""
+
+        async def build(hp):
+            hp.Float("x", 0.0, 1.0)
+
+            class _FailingProgram:
+                optimizer = object()  # truthy → dispatch to fit() branch
+
+                async def fit(self_inner, *args, **kwargs):
+                    raise ValueError("trial-boom")
+
+            return _FailingProgram()
+
+        return build
+
+    def test_search_under_running_loop_surfaces_real_error_not_loop_crash(self):
+        # Regression for the open-arena crash: callers drive `search()` from
+        # inside their own `asyncio.run(...)` (open-arena's `run_sweep`). When
+        # trials fail, keras_tuner raises its consecutive-failure RuntimeError
+        # out of `super().search()`. That call used to sit INSIDE a
+        # `try/except RuntimeError: pass`, so the real error was swallowed and
+        # `search()` fell through to build its OWN event loop and re-run the
+        # search on top of the already-running one, dying with "Cannot run
+        # the event loop while another loop is running", further masked as
+        # "AttributeError: 'NoneType' object has no attribute 'items'".
+        #
+        # With the fix, under a running loop `search()` delegates and lets the
+        # honest failure propagate; it never installs a loop of its own.
+        disable_keras_backend()
+        build = self._build_failing_program_factory()
+        tuner = RandomSearch(
+            hypermodel=build,
+            objective=Objective("val_reward", direction="max"),
+            max_trials=5,
+            directory=self._tmpdir,
+            project_name="under_running_loop_failing",
+            overwrite=True,
+            seed=42,
+        )
+
+        async def _driver():
+            tuner.search(epochs=1)
+
+        with self.assertRaises(Exception) as cm:
+            asyncio.run(_driver())
+
+        # Walk the full __cause__/__context__ chain to a single string.
+        chain, exc = [], cm.exception
+        seen_ids = set()
+        while exc is not None and id(exc) not in seen_ids:
+            seen_ids.add(id(exc))
+            chain.append(f"{type(exc).__name__}: {exc}")
+            exc = exc.__cause__ or exc.__context__
+        chain_text = " || ".join(chain)
+
+        self.assertNotIn(
+            "Cannot run the event loop while another loop is running",
+            chain_text,
+            f"search() spun up a second loop under a running loop: {chain_text}",
+        )
+        self.assertNotIn(
+            "'NoneType' object has no attribute 'items'",
+            chain_text,
+            f"real error was masked by the None-context bug: {chain_text}",
+        )
+        # search() must not have installed its own search-wide loop.
+        self.assertIsNone(getattr(tuner, "_synalinks_search_loop", None))
+
+    def test_async_hypermodel_populates_space_at_construction(self):
+        """An `async def build` must have its body run during the synchronous
+        space exploration in `BaseTuner.__init__`.
+
+        Regression test for the `RuntimeWarning: coroutine 'build_program' was
+        never awaited` raised when kt called the async hypermodel synchronously:
+        the coroutine body never ran, so `hp.Float(...)` never registered and
+        the initial search space was left empty. We assert both that no such
+        warning fires at construction and that the space is populated before
+        `search()` is ever called.
+        """
+        import warnings
+
+        disable_keras_backend()
+
+        async def build(hp):
+            hp.Float("x", 0.0, 1.0)
+
+            class _FakeProgram:
+                optimizer = object()
+
+                async def fit(self_inner, *args, **kwargs):
+                    h = SynalinksHistory()
+                    h.history = {"val_reward": [1.0]}
+                    return h
+
+            return _FakeProgram()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            tuner = RandomSearch(
+                hypermodel=build,
+                objective=Objective("val_reward", direction="max"),
+                max_trials=2,
+                directory=self._tmpdir,
+                project_name="async_space_population",
+                overwrite=True,
+                seed=1,
+            )
+
+        # The hyperparameter registered inside the async build must be visible
+        # in the oracle's space *before* any trial runs.
+        space_names = {hp.name for hp in tuner.oracle.get_space().space}
+        self.assertIn("x", space_names)
+
+    def test_sync_hypermodel_is_also_accepted(self):
+        """Hypermodels that return a Program directly (no `async def`) must
+        work: `inspect.isawaitable` falls through to the program as-is."""
+        disable_keras_backend()
+
+        def build(hp):
+            x = hp.Float("x", 0.0, 1.0)
+
+            class _FakeProgram:
+                optimizer = object()  # truthy → dispatch to fit() branch
+
+                async def fit(self_inner, *args, **kwargs):
+                    h = SynalinksHistory()
+                    h.history = {"val_reward": [1.0 - abs(x - 0.5)]}
+                    return h
+
+            return _FakeProgram()
+
+        tuner = RandomSearch(
+            hypermodel=build,
+            objective=Objective("val_reward", direction="max"),
+            max_trials=4,
+            directory=self._tmpdir,
+            project_name="sync_hypermodel",
+            overwrite=True,
+            seed=7,
+        )
+        tuner.search()
+        self.assertEqual(len(tuner.oracle.trials), 4)
+        for t in tuner.oracle.trials.values():
+            self.assertEqual(t.status, "COMPLETED")
+
+    def test_multi_objective_drives_search_end_to_end(self):
+        """Multi-objective: pass a list of `Objective`s to the tuner. kt
+        wraps them in a `MultiObjective`, and we reduce each metric in
+        its own direction inside `_history_to_metrics_dict`."""
+        disable_keras_backend()
+        seen = []
+
+        async def build(hp):
+            x = hp.Float("x", 0.0, 1.0)
+            seen.append(x)
+
+            class _FakeProgram:
+                optimizer = object()  # truthy → dispatch to fit() branch
+
+                async def fit(self_inner, *args, **kwargs):
+                    h = SynalinksHistory()
+                    # Two competing metrics in different directions.
+                    h.history = {
+                        "val_reward": [1.0 - abs(x - 0.3)],  # maximize
+                        "val_loss": [abs(x - 0.3)],  # minimize
+                    }
+                    return h
+
+            return _FakeProgram()
+
+        tuner = RandomSearch(
+            hypermodel=build,
+            objective=[
+                Objective("val_reward", direction="max"),
+                Objective("val_loss", direction="min"),
+            ],
+            max_trials=10,
+            directory=self._tmpdir,
+            project_name="multi_objective",
+            overwrite=True,
+            seed=13,
+        )
+        tuner.search()
+
+        self.assertEqual(len(tuner.oracle.trials), 10)
+        # kt's `MultiObjective` aggregates as (-max metrics + min metrics);
+        # both peaks coincide at x=0.3 in this fake, so the best trial
+        # should land near it.
+        best = tuner.get_best_hyperparameters(num_trials=1)[0]
+        self.assertLess(abs(best.get("x") - 0.3), 0.3)
+
+        # Each completed trial must carry both metric values (not just the
+        # objective name); confirms we don't drop non-aggregated metrics
+        # when the objective is a MultiObjective.
+        for trial in tuner.oracle.trials.values():
+            self.assertEqual(trial.status, "COMPLETED")
+            self.assertIn("val_reward", trial.metrics.metrics)
+            self.assertIn("val_loss", trial.metrics.metrics)
+
+    def test_min_direction_picks_lowest_value(self):
+        disable_keras_backend()
+
+        async def build(hp):
+            x = hp.Float("x", 0.0, 1.0)
+
+            class _FakeProgram:
+                optimizer = object()  # truthy → dispatch to fit() branch
+
+                async def fit(self_inner, *args, **kwargs):
+                    h = SynalinksHistory()
+                    h.history = {"val_loss": [abs(x - 0.8)]}
+                    return h
+
+            return _FakeProgram()
+
+        tuner = RandomSearch(
+            hypermodel=build,
+            objective=Objective("val_loss", direction="min"),
+            max_trials=10,
+            directory=self._tmpdir,
+            project_name="min_direction",
+            overwrite=True,
+            seed=11,
+        )
+        tuner.search()
+        best = tuner.get_best_hyperparameters(num_trials=1)[0]
+        self.assertLess(abs(best.get("x") - 0.8), 0.3)
+
+    def test_sweep_records_each_models_own_metrics(self):
+        """End-to-end guard for BOTH tuner-sweep metric-sharing bugs.
+
+        A model sweep = one `GridSearch` over `Choice("language_model", ...)`,
+        one real `synalinks.Program` per model built and compiled up front, all
+        sharing ONE metrics list (as reusing a list across trials naturally
+        does). Two distinct bugs make that list leak across trials:
+
+        1. Operational metrics (`TotalTokens`) bind to a program's
+           `LanguageModel` on `compile()`. A shared instance ends up bound to
+           whichever program was compiled LAST, so every earlier trial reads
+           the last model's counters (symptom: only the last model reports
+           non-zero ops).
+        2. Ordinary metrics (`MeanMetricWrapper`) accumulate state that is only
+           reset per program via its own lazily-built `CompileMetrics`; a
+           shared instance is never reset between trials, so trial N reads the
+           running mean over trials 1..N instead of its own value.
+
+        Both are driven through the real `tuner.search()` loop and read back as
+        `open-arena/evaluate.py` does, via `trial.metrics.get_best_value(...)`.
+        Each model returns a distinct, deterministic token count AND a distinct
+        answer value so both metrics are per-model identifiable.
+        """
+        import json
+        from unittest.mock import patch
+
+        from litellm.types.utils import Choices
+        from litellm.types.utils import Message
+        from litellm.types.utils import ModelResponse
+        from litellm.types.utils import Usage
+
+        from synalinks.src import metrics as metrics_module
+        from synalinks.src import modules
+        from synalinks.src import programs
+        from synalinks.src import rewards
+        from synalinks.src.metrics.lm_metrics import TotalTokens
+        from synalinks.src.modules.language_models import LanguageModel
+        from synalinks.src.testing.test_utils import AnswerWithRationale
+        from synalinks.src.testing.test_utils import Query
+        from synalinks.src.testing.test_utils import load_test_data
+
+        disable_keras_backend()
+
+        model_ids = ["ollama/model-a", "ollama/model-b", "ollama/model-c"]
+        per_call_tokens = {
+            "ollama/model-a": 10,
+            "ollama/model-b": 20,
+            "ollama/model-c": 30,
+        }
+        # Distinct predicted answer value per model -> distinct ordinary metric.
+        answer_value_of = {
+            "ollama/model-a": 1.0,
+            "ollama/model-b": 2.0,
+            "ollama/model-c": 3.0,
+        }
+
+        def canon(model_str):
+            # synalinks rewrites "ollama/x" -> "ollama_chat/x"; match by suffix.
+            for m in model_ids:
+                if model_str.endswith(m.split("/", 1)[1]):
+                    return m
+            raise AssertionError(f"unexpected model {model_str!r}")
+
+        calls = {m: 0 for m in model_ids}
+
+        async def fake_acompletion(*args, **kwargs):
+            model = canon(kwargs.get("model") or args[0])
+            calls[model] += 1
+            tok = per_call_tokens[model]
+            answer = AnswerWithRationale(
+                rationale="because", answer=str(answer_value_of[model])
+            )
+            return ModelResponse(
+                id="x",
+                model=model,
+                choices=[
+                    Choices(
+                        message=Message(
+                            content=json.dumps(answer.get_json()), role="assistant"
+                        ),
+                        index=0,
+                        finish_reason="stop",
+                    )
+                ],
+                usage=Usage(prompt_tokens=tok, completion_tokens=0, total_tokens=tok),
+            )
+
+        async def answer_value(y_true, y_pred):
+            try:
+                return float(y_pred.get("answer"))
+            except (TypeError, ValueError):
+                return 0.0
+
+        async def build(model):
+            x0 = modules.Input(data_model=Query)
+            x1 = await modules.Generator(
+                data_model=AnswerWithRationale,
+                language_model=LanguageModel(model=model),
+            )(x0)
+            return programs.Program(inputs=x0, outputs=x1, name=model.replace("/", "_"))
+
+        # Build + compile every program up front (as the sweep does), all
+        # sharing ONE operational AND one ordinary metric instance. No
+        # optimizer -> the tuner dispatches to `program.evaluate(...)`.
+        loop = asyncio.new_event_loop()
+        try:
+            programs_by_id = {m: loop.run_until_complete(build(m)) for m in model_ids}
+        finally:
+            loop.close()
+        shared_ops = TotalTokens()
+        shared_ordinary = metrics_module.MeanMetricWrapper(
+            answer_value, name="answer_value"
+        )
+        for m in model_ids:
+            programs_by_id[m].compile(
+                reward=rewards.ExactMatch(in_mask=["answer"]),
+                metrics=[shared_ordinary, shared_ops],
+            )
+
+        def hypermodel(hp):
+            return programs_by_id[hp.Choice("language_model", values=model_ids)]
+
+        tuner = GridSearch(
+            hypermodel,
+            objective=Objective("reward", direction="max"),
+            max_trials=len(model_ids),
+            directory=self._tmpdir,
+            project_name="ops_sweep",
+            overwrite=True,
+        )
+
+        (_, _), (x_test, y_test) = load_test_data()
+        with patch("litellm.acompletion", side_effect=fake_acompletion):
+            tuner.search(validation_data=(x_test, y_test), verbose=0)
+
+        tokens, ordinary = {}, {}
+        for trial in tuner.oracle.trials.values():
+            model = trial.hyperparameters.get("language_model")
+            tokens[model] = trial.metrics.get_best_value("total_tokens")
+            ordinary[model] = trial.metrics.get_best_value("answer_value")
+
+        self.assertEqual(set(tokens), set(model_ids))
+        for m in model_ids:
+            # Operational: each model's own token count (not the last model's).
+            self.assertEqual(
+                tokens[m],
+                per_call_tokens[m] * calls[m],
+                f"{m} recorded {tokens[m]} tokens; a shared-binding leak would "
+                f"make every non-last model read 0 / the last model's count",
+            )
+            # Ordinary: each model's own value (not the running mean over trials).
+            self.assertAlmostEqual(
+                ordinary[m],
+                answer_value_of[m],
+                msg=f"{m} recorded answer_value={ordinary[m]}; un-reset shared "
+                f"state would leak the mean over earlier trials",
+            )
+        # Distinct per-model values (guards against a degenerate all-equal pass).
+        self.assertEqual(len(set(tokens.values())), len(model_ids))
+        self.assertEqual(len(set(ordinary.values())), len(model_ids))
+
+
+class ObjectiveDirectionInferenceTest(testing.TestCase):
+    """When `direction` is omitted on `synalinks.tuners.Objective` or when a
+    bare string objective like `objective="val_reward"` is passed to a tuner,
+    direction should resolve via the synalinks metrics registry (each metric
+    class carries a `direction` class attribute) and fall through to
+    keras-tuner's original inference for keras-compatible names like
+    `"loss"`. Reset the patch state per test so the patch is re-applied to
+    a freshly-imported `keras_tuner` module."""
+
+    def setUp(self):
+        super().setUp()
+        from synalinks.src.utils.keras_backend import disable_keras_backend
+
+        disable_keras_backend()
+        try:
+            import keras_tuner  # noqa: F401
+        except Exception as e:
+            self.skipTest(f"keras_tuner is not importable: {type(e).__name__}: {e}")
+        self._saved = {
+            name: sys.modules.pop(name)
+            for name in list(sys.modules)
+            if _is_managed_module(name)
+        }
+        # Popping cleared the stubbed `keras` from `sys.modules`; re-install it
+        # so the test body's fresh `import keras_tuner` binds to the stub rather
+        # than pulling real Keras (which needs a backend like TensorFlow).
+        disable_keras_backend()
+        keras_tuner_utils._kt_inference_patched = False
+
+    def tearDown(self):
+        keras_tuner_utils._kt_inference_patched = False
+        for name in list(sys.modules):
+            if _is_managed_module(name):
+                sys.modules.pop(name, None)
+        for name, m in self._saved.items():
+            sys.modules[name] = m
+        super().tearDown()
+
+    def test_reward_infers_as_max(self):
+        """`"reward"` is the conventional name for a `Mean`/wrapper around a
+        synalinks `Reward` and is not a class name in the registry; it's
+        special-cased to `"max"` in `_synalinks_name_direction_map`."""
+        obj = Objective("val_reward")
+        self.assertEqual(obj.direction, "max")
+
+    def test_accuracy_infers_as_max(self):
+        """`Accuracy.direction == "up"` (class attr) → kt `"max"`."""
+        obj = Objective("accuracy")
+        self.assertEqual(obj.direction, "max")
+
+    def test_f1_score_infers_as_max(self):
+        """Inherited via `FBetaScore.direction = "up"` on the parent."""
+        obj = Objective("val_f1_score")
+        self.assertEqual(obj.direction, "max")
+
+    def test_program_cost_infers_as_min(self):
+        """`ProgramOperationalMetric.direction == "down"` → kt `"min"`."""
+        obj = Objective("val_program_cost")
+        self.assertEqual(obj.direction, "min")
+
+    def test_loss_falls_through_to_kt_inference(self):
+        """kt's original `infer_metric_direction` handles `"loss"` as a
+        special case. The synalinks patch falls through for names not in
+        its table, verifying compatibility is preserved."""
+        obj = Objective("val_loss")
+        self.assertEqual(obj.direction, "min")
+
+    def test_unknown_name_raises_with_remediation(self):
+        with self.assertRaises(ValueError) as ctx:
+            Objective("val_totally_made_up")
+        self.assertIn("Could not infer", str(ctx.exception))
+        self.assertIn("direction=", str(ctx.exception))
+
+    def test_explicit_direction_bypasses_inference(self):
+        """A user-supplied direction overrides registry lookup, useful for
+        custom metrics with no `direction` set."""
+        obj = Objective("any_unknown_metric", direction="min")
+        self.assertEqual(obj.direction, "min")

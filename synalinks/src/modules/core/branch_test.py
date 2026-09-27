@@ -1,14 +1,18 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
+import os
 from unittest.mock import patch
 
 from synalinks.src import testing
 from synalinks.src.backend import DataModel
-from synalinks.src.language_models import LanguageModel
 from synalinks.src.modules import Input
 from synalinks.src.modules.core.branch import Branch
 from synalinks.src.modules.core.generator import Generator
+from synalinks.src.modules.core.identity import Identity
+from synalinks.src.modules.decision_models import DecisionModel
+from synalinks.src.modules.language_models import LanguageModel
 from synalinks.src.programs import Program
+from synalinks.src.testing.test_utils import mock_decision_model
 
 
 class BranchTest(testing.TestCase):
@@ -69,3 +73,84 @@ class BranchTest(testing.TestCase):
 
         result = await program(Query(query="What is the French capital?"))
         self.assertEqual(result.get("answer"), "Paris")
+
+
+@patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"})
+class BranchWithDecisionModelTest(testing.TestCase):
+    @patch("litellm.acompletion")
+    async def test_routes_with_decision_model(self, mock_completion):
+        class Query(DataModel):
+            query: str
+
+        class Answer(DataModel):
+            answer: str
+
+        mock_completion.return_value = {
+            "choices": [{"message": {"content": '{"answer": "Paris"}'}}]
+        }
+        decision_model = DecisionModel(model="typesafe/jev-latest")
+        mock_decision_model(
+            decision_model,
+            {
+                "decision": {
+                    "type": "choice",
+                    "choice": "easy",
+                    "probabilities": {"easy": 0.9, "difficult": 0.1},
+                    "confidence": 0.8,
+                }
+            },
+        )
+        language_model = LanguageModel(model="ollama/mistral")
+
+        x0 = Input(data_model=Query)
+        (x1, x2) = await Branch(
+            question="What is the difficulty level of the query?",
+            labels=["easy", "difficult"],
+            branches=[
+                Generator(data_model=Answer, language_model=language_model),
+                Generator(data_model=Answer, language_model=language_model),
+            ],
+            decision_model=decision_model,
+            return_decision=False,
+        )(x0)
+        program = Program(inputs=x0, outputs=[x1, x2])
+
+        easy, difficult = await program(Query(query="What is the French capital?"))
+
+        self.assertEqual(easy.get_json(), {"answer": "Paris"})
+        self.assertIsNone(difficult)
+
+    async def test_min_confidence_selects_no_branch(self):
+        class Query(DataModel):
+            query: str
+
+        decision_model = DecisionModel(model="typesafe/jev-latest")
+        mock_decision_model(
+            decision_model,
+            {
+                "decision": {
+                    "type": "choice",
+                    "choice": "easy",
+                    "probabilities": {"easy": 0.55, "difficult": 0.45},
+                    "confidence": 0.1,
+                }
+            },
+        )
+        x0 = Input(data_model=Query)
+        (x1, x2) = await Branch(
+            question="Easy?",
+            labels=["easy", "difficult"],
+            branches=[Identity(), Identity()],
+            decision_model=decision_model,
+            min_confidence=0.5,
+        )(x0)
+        program = Program(inputs=x0, outputs=[x1, x2])
+
+        easy, difficult = await program(Query(query="q"))
+
+        self.assertIsNone(easy)
+        self.assertIsNone(difficult)
+        branch = program.get_module(index=1)
+        restored = Branch.from_config(branch.get_config())
+        self.assertEqual(restored.min_confidence, 0.5)
+        self.assertEqual(restored.decision.min_confidence, 0.5)

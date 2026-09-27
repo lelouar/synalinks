@@ -8,6 +8,7 @@
 - [Can Synalinks be used for non-LMs applications](#can-synalinks-be-used-for-non-lms-applications)
 - [What are my options for saving programs?](#what-are-my-options-for-saving-programs)
 - [How to do hyperparameter tuning with Synalinks?](#how-to-do-hyperparameter-tuning-with-synalinks)
+- [How to pick the right LM when accuracy, cost, and latency all matter?](#how-to-pick-the-right-lm-when-accuracy-cost-and-latency-all-matter)
 - [Where is the Synalinks configuration file stored?](#where-is-the-synalinks-configuration-file-stored)
 - [How should I cite Synalinks?](#how-should-i-cite-synalinks)
 - [Do you provide help or support?](#do-you-provide-help-or-support)
@@ -87,7 +88,13 @@ You can then load the variables into a program *with the same architecture*:
 
 ### How to do hyperparameter tuning with Synalinks?
 
-Synalinks is compatible with [KerasTuner](https://keras.io/keras_tuner/) which allows you to find hyperparameters.
+Synalinks is compatible with [KerasTuner](https://keras.io/keras_tuner/) which allows you to find hyperparameters. See the [Hyperparameter Search](guides/Hyperparameter%20Search.md) guide for a step-by-step walkthrough.
+
+---
+
+### How to pick the right LM when accuracy, cost, and latency all matter?
+
+Synalinks lets you score candidate language models against multiple objectives at once (reward, dollars per call, response time, etc.) and pick the LM that sits on the Pareto frontier of those trade-offs. See the [Multi-Objective LM Selection](guides/Multi-Objective%20LM%20Selection.md) guide for the full workflow.
 
 ---
 
@@ -158,6 +165,7 @@ Example:
 import synalinks
 import asyncio
 
+
 async def main():
     class ThinkingWithAnswer(synalinks.DataModel):
         thinking: str
@@ -180,14 +188,15 @@ async def main():
         ]
     )
 
-    program.modules[0].trainable = False # Freeze the first generator
+    program.modules[0].trainable = False  # Freeze the first generator
 
     assert program.modules[0].trainable_variables == []
 
     program.compile(...)
-    history = await program.fit(...) # Train only the second generator
+    history = await program.fit(...)  # Train only the second generator
 
-if __main__ == "__name__":
+
+if __name__ == "__main__":
     asyncio.run(main())
 ```
 

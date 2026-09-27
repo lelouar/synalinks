@@ -1,9 +1,11 @@
 # Modified from: keras/src/layers/layer.py
 # Original authors: François Chollet et al. (Keras Team)
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import collections
+import contextvars
 import inspect
+import time
 import uuid
 import warnings
 from functools import wraps
@@ -14,8 +16,8 @@ from synalinks.src import tree
 from synalinks.src import utils
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend import is_trainable
-from synalinks.src.backend.common import global_state
 from synalinks.src.backend.common.name_scope import current_path
+from synalinks.src.backend.common.op_scope import current_op_scope
 from synalinks.src.hooks.hook_list import HookList
 from synalinks.src.metrics import Metric
 from synalinks.src.ops.operation import Operation
@@ -31,6 +33,18 @@ else:
     raise RuntimeError(
         f"Backend '{backend.backend()}' must implement a module mixin class."
     )
+
+
+# Per-call execution context (`call_id`, `parent_call_id`, `training`,
+# `entry_module`). Stored in a `contextvars.ContextVar` rather than the
+# `threading.local` global state: an asyncio event loop runs many coroutines on
+# a single OS thread, so a thread-local context is shared (and corrupted)
+# between modules awaited concurrently, e.g. `asyncio.gather(modA(x), modB(x))`
+# or parallel branches in a `Program`. A `ContextVar` is copied into each
+# `asyncio.Task`/greenlet at creation, so concurrent calls each get an isolated
+# context while nested `await`s within a single call keep sharing it. This
+# mirrors the `op_scope` ContextVar (see `backend/common/op_scope.py`).
+_CALL_CONTEXT = contextvars.ContextVar("synalinks_call_ctx", default=None)
 
 
 @synalinks_export(["synalinks.Module", "synalinks.modules.Module"])
@@ -149,6 +163,18 @@ class Module(BackendModule, Operation, SynalinksSaveable):
             hooks=hooks,
             module=self,
         )
+        # Top-level invocation counters. Bumped only when this module is the
+        # entry module of a `CallContext`, i.e., when it's the outermost
+        # `__call__` in the stack. Nested calls leave these untouched.
+        # Phase routing follows the same `op_scope` contextvar convention as
+        # LanguageModel / EmbeddingModel.
+        # Named `invocations` (not `calls`) to avoid colliding with the
+        # LM/EM `cumulated_calls` semantic (= one provider call per increment).
+        self.cumulated_invocations = 0
+        self.cumulated_invocation_elapsed_s = 0.0
+        for _phase in ("inference", "reward", "optimizer"):
+            setattr(self, f"{_phase}_cumulated_invocations", 0)
+            setattr(self, f"{_phase}_cumulated_invocation_elapsed_s", 0.0)
         self._initialize_tracker()
 
     @tracking.no_automatic_dependency_tracking
@@ -517,7 +543,7 @@ class Module(BackendModule, Operation, SynalinksSaveable):
         self._check_super_called()
         self._called = True
 
-        call_context = self._get_call_context()
+        call_context, call_ctx_token = self._enter_call_context()
 
         parent_call_id = call_context.call_id if call_context.call_id else None
 
@@ -611,7 +637,7 @@ class Module(BackendModule, Operation, SynalinksSaveable):
             raise e
         finally:
             # Destroy call context if we created it
-            self._maybe_reset_call_context()
+            self._maybe_reset_call_context(call_ctx_token)
         if self._hooks:
             self._hooks.on_call_end(
                 call_id=call_id,
@@ -688,20 +714,66 @@ class Module(BackendModule, Operation, SynalinksSaveable):
         )
         return inputs
 
-    def _get_call_context(self):
-        """Returns currently active `CallContext`."""
-        module_call_ctx = global_state.get_global_attribute("current_call_ctx")
+    def _enter_call_context(self):
+        """Returns the active `CallContext`, creating one if this is the entry
+        (outermost) module call.
+
+        The context lives in the `_CALL_CONTEXT` ContextVar, so concurrent
+        calls awaited on one event loop thread each get an isolated context
+        (see the note on `_CALL_CONTEXT`).
+
+        Returns a `(call_context, token)` tuple. `token` is the
+        `ContextVar.reset` token when this call created the context (and is
+        therefore the entry module); it is `None` when reusing a parent's
+        context. Pass the token to `_maybe_reset_call_context` to tear it down.
+        """
+        module_call_ctx = _CALL_CONTEXT.get()
         if module_call_ctx is None:
             # Enter new call context.
             module_call_ctx = CallContext(entry_module=self)
-            global_state.set_global_attribute("current_call_ctx", module_call_ctx)
+            token = _CALL_CONTEXT.set(module_call_ctx)
             self._clear_rewards()
-        return module_call_ctx
+            return module_call_ctx, token
+        return module_call_ctx, None
 
-    def _maybe_reset_call_context(self):
-        module_call_ctx = global_state.get_global_attribute("current_call_ctx")
-        if module_call_ctx is None or module_call_ctx.entry_module == self:
-            global_state.set_global_attribute("current_call_ctx", None)
+    def _get_call_context(self):
+        """Returns the currently active `CallContext`, or `None`.
+
+        Read-only peek used by hooks/monitoring; unlike `_enter_call_context`
+        it never creates a context.
+        """
+        return _CALL_CONTEXT.get()
+
+    def _maybe_reset_call_context(self, token):
+        """Tear down the `CallContext` created by this call's
+        `_enter_call_context`.
+
+        A no-op for nested calls (`token is None`), which reuse the entry
+        module's context. When this call is the entry module, it accumulates
+        the invocation metrics and restores the ContextVar to its previous
+        (`None`) state via `token`.
+        """
+        if token is None:
+            return
+        module_call_ctx = _CALL_CONTEXT.get()
+        if module_call_ctx is not None and module_call_ctx.entry_module is self:
+            elapsed_s = time.perf_counter() - module_call_ctx.start_time
+            self.cumulated_invocations += 1
+            self.cumulated_invocation_elapsed_s += elapsed_s
+            op_scope = current_op_scope()
+            if op_scope in ("inference", "reward", "optimizer"):
+                setattr(
+                    self,
+                    f"{op_scope}_cumulated_invocations",
+                    getattr(self, f"{op_scope}_cumulated_invocations") + 1,
+                )
+                setattr(
+                    self,
+                    f"{op_scope}_cumulated_invocation_elapsed_s",
+                    getattr(self, f"{op_scope}_cumulated_invocation_elapsed_s")
+                    + elapsed_s,
+                )
+        _CALL_CONTEXT.reset(token)
 
     def _flatten_modules(self, include_self=True, recursive=True):
         modules = []
@@ -782,12 +854,21 @@ class Module(BackendModule, Operation, SynalinksSaveable):
         # Otherwise, attempt to build the module by calling it on symbolic input.
         if might_have_unbuilt_state(self):
             try:
+                # Trace on *symbolic* inputs: an eager call hands us concrete
+                # `JsonDataModel`s, and tracing `call()` on those would run the
+                # real forward pass (e.g. an LM request in `Generator`) just to
+                # discover the output schema. Converting first keeps the build
+                # purely symbolic, exactly like the functional API path.
+                symbolic_arguments = tree.map_structure(
+                    lambda x: (
+                        x.to_symbolic_data_model() if backend.is_json_data_model(x) else x
+                    ),
+                    call_spec.arguments_dict,
+                )
                 if not utils.is_default(self.compute_output_spec):
-                    await self.compute_output_spec(**call_spec.arguments_dict)
+                    await self.compute_output_spec(**symbolic_arguments)
                 else:
-                    await backend.compute_output_spec(
-                        self.call, **call_spec.arguments_dict
-                    )
+                    await backend.compute_output_spec(self.call, **symbolic_arguments)
             except Exception as e:
                 if call_spec.eager:
                     # Will let the actual eager call do state-building
@@ -886,6 +967,7 @@ class CallContext:
         self.call_id = call_id
         self.parent_call_id = parent_call_id
         self.cost = 0.0
+        self.start_time = time.perf_counter()
 
 
 def might_have_unbuilt_state(module):

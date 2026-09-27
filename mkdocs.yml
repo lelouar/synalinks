@@ -5,13 +5,15 @@ repo_url: https://github.com/SynaLinks/synalinks
 repo_name: SynaLinks/synalinks
 theme:
   name: material
-  logo: assets/synalinks_logo.png
+  # Dot-prefixed so the build skips it when copying docs/ files into the site.
+  custom_dir: docs/.overrides
+  logo: assets/synalinks-light.svg
   favicon: assets/synalinks_favicon.png
   features:
     - content.code.copy
+    - announce.dismiss
   icon:
     repo: fontawesome/brands/github
-  theme:
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
@@ -24,6 +26,7 @@ extra_javascript:
 
 markdown_extensions:
   - admonition
+  - pymdownx.details
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.superfences:
@@ -31,39 +34,55 @@ markdown_extensions:
         - name: mermaid
           class: mermaid
           format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.snippets:
+      base_path:
+        - .
+      check_paths: true
 
 plugins:
   - search
   - mkdocstrings:
       default_handler: python
   - glightbox
-  - llmstxt:
-      full_output: llms-full.txt
-      markdown_description: Keras based LM framework for neuro-symbolic applications and In-Context learning
-      sections:
-        Usage documentation:
-        - Introduction.md
-        - Synalinks API/Programs API/Program training API.md
-        - Synalinks API/Programs API/The Program class.md
-        - Synalinks API/Programs API/The Sequential class.md
-        - Synalinks API/* module.md
-        - Synalinks API/Rewards/* reward.md
-        - Synalinks API/Rewards/* wrappers.md
 
 nav:
   - index.md
   - Introduction.md
+  - Project Templates.md
   - Guides:
     - guides/Getting Started.md
     - guides/Data Models.md
     - guides/Programs.md
     - guides/Modules.md
+    - guides/Control Flow.md
+    - guides/Decision Models.md
     - guides/Agents.md
     - guides/Knowledge Base.md
-    - guides/Training.md
-    - guides/Observability.md
+    - guides/Knowledge Graph Extraction.md
+    - guides/Free-form Knowledge Graph Extraction.md
+    - guides/GraphRAG.md
     - guides/Input Guard.md
     - guides/Output Guard.md
+    - guides/Observability.md
+    - guides/Datasets.md
+    - guides/Trainable Variables.md
+    - guides/Rewards.md
+    - guides/Metrics.md
+    - guides/Training.md
+    - guides/Callbacks.md
+    - guides/Multimodal Inputs.md
+    - guides/Hyperparameter Search.md
+    - guides/Multi-Objective LM Selection.md
+    - guides/Recursive Language Model Agent.md
+    - guides/SQL Agent.md
+    - guides/Cypher Agent.md
+    - guides/Vector RAG Agent.md
+    - guides/Deep Agent.md
+    - guides/Mixture of Models.md
+    - guides/Consul of Models.md
+    - guides/FastAPI Deployment.md
+    - guides/FastMCP Deployment.md
+    - guides/Python Synthesis.md
   - Code Examples:
     - Code Examples/First Steps.md
     - Code Examples/Functional API.md
@@ -81,12 +100,18 @@ nav:
     - Code Examples/Implementing Custom Modules Via Subclassing.md
     - Code Examples/Autonomous Agent.md
     - Code Examples/Interactive Agent.md
+    - Code Examples/Recursive Language Model Agent.md
     - Code Examples/Knowledge Extraction and Storage.md
     - Code Examples/Document RAG.md
-    - Code Examples/RAG Agent.md
+    - Code Examples/Vector RAG Agent.md
     - Code Examples/MCP Agent.md
     - Code Examples/SQL Agent.md
+    - Code Examples/Cypher Agent.md
+    - Code Examples/Deep Agent.md
+    - Code Examples/Python Synthesis.md
   - Modules: Synalinks API/Modules API/index.md
+  - Rewards: Synalinks API/Rewards/index.md
+  - Metrics: Synalinks API/Metrics/index.md
   - FAQ.md
   - CheatSheet.md
   - Differences with Keras.md
@@ -94,7 +119,14 @@ nav:
   - Synalinks API:
     - Synalinks API/Language Models API.md
     - Synalinks API/Embedding Models API.md
-    - Synalinks API/Knowledge Bases API.md
+    - Synalinks API/Decision Models API.md
+    - Knowledge Base API:
+      - Synalinks API/Knowledge Base API/Knowledge Base.md
+      - Database Adapters:
+        - Synalinks API/Knowledge Base API/Database Adapters/DuckDB Adapter.md
+        - Synalinks API/Knowledge Base API/Database Adapters/LanceDB Adapter.md
+      - Graph Database Adapters:
+        - Synalinks API/Knowledge Base API/Graph Database Adapters/Ladybug Adapter.md
     - Data Models API:
       - Synalinks API/Data Models API/index.md
       - Synalinks API/Data Models API/The DataModel class.md
@@ -102,6 +134,9 @@ nav:
       - Synalinks API/Data Models API/The SymbolicDataModel class.md
       - Synalinks API/Data Models API/The Variable class.md
       - Synalinks API/Data Models API/The Base DataModels.md
+      - Synalinks API/Data Models API/Knowledge Data Models.md
+      - Synalinks API/Data Models API/Multimodal Data Models.md
+      - Synalinks API/Data Models API/Score Data Models.md
     - Programs API:
       - Synalinks API/Programs API/index.md
       - Synalinks API/Programs API/The Program class.md
@@ -120,12 +155,18 @@ nav:
         - Synalinks API/Modules API/Core Modules/Not module.md
         - Synalinks API/Modules API/Core Modules/Generator module.md
         - Synalinks API/Modules API/Core Modules/Decision module.md
+        - Synalinks API/Modules API/Core Modules/MultiDecision module.md
         - Synalinks API/Modules API/Core Modules/Action module.md
         - Synalinks API/Modules API/Core Modules/Branch module.md
         - Synalinks API/Modules API/Core Modules/Tool module.md
       - Agents Modules:
         - Synalinks API/Modules API/Agents Modules/index.md
         - Synalinks API/Modules API/Agents Modules/FunctionCallingAgent module.md
+        - Synalinks API/Modules API/Agents Modules/CypherAgent module.md
+        - Synalinks API/Modules API/Agents Modules/RLMAgent module.md
+        - Synalinks API/Modules API/Agents Modules/SQLAgent module.md
+        - Synalinks API/Modules API/Agents Modules/VectorRAGAgent module.md
+        - Synalinks API/Modules API/Agents Modules/DeepAgent module.md
       - Knowledge Modules:
         - Synalinks API/Modules API/Knowledge Modules/index.md
         - Synalinks API/Modules API/Knowledge Modules/EmbedKnowledge module.md
@@ -149,6 +190,34 @@ nav:
         - Synalinks API/Modules API/Synthesis Modules/index.md
         - Synalinks API/Modules API/Synthesis Modules/PythonSynthesis module.md
         - Synalinks API/Modules API/Synthesis Modules/SequentialPlanSynthesis module.md
+      - Retrievers Modules:
+        - Synalinks API/Modules API/Retrievers Modules/index.md
+        - Synalinks API/Modules API/Retrievers Modules/SimilaritySearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/FullTextSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/RegexSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/HybridFTSSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/HybridRegexSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/EntitySimilaritySearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/EntityFullTextSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/EntityRegexSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/EntityHybridFTSSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/EntityHybridRegexSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/RelationSimilaritySearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/RelationFullTextSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/RelationRegexSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/RelationHybridFTSSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/RelationHybridRegexSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/PathSimilaritySearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/PathFullTextSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/PathRegexSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/PathHybridFTSSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/PathHybridRegexSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/LocalGraphSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/GlobalGraphSearch module.md
+        - Synalinks API/Modules API/Retrievers Modules/GlobalGraphMapReduce module.md
+      - Rerankers Modules:
+        - Synalinks API/Modules API/Rerankers Modules/index.md
+        - Synalinks API/Modules API/Rerankers Modules/RRFReranker module.md
     - Callbacks API:
       - Synalinks API/Callbacks API/index.md
       - Synalinks API/Callbacks API/Base Callback class.md
@@ -156,17 +225,17 @@ nav:
       - Synalinks API/Callbacks API/CSVLogger.md
       - Synalinks API/Callbacks API/BackUpAndRestore.md
       - Synalinks API/Callbacks API/EarlyStopping.md
+      - Synalinks API/Callbacks API/BudgetStopping.md
       - Synalinks API/Callbacks API/Monitor.md
     - Hooks API:
       - Synalinks API/Hooks API/index.md
       - Synalinks API/Hooks API/Base Hook class.md
       - Synalinks API/Hooks API/Logger.md
       - Synalinks API/Hooks API/Monitor.md
+      - Synalinks API/Hooks API/Recorder.md
     - Ops API:
       - Synalinks API/Ops API/index.md
       - Synalinks API/Ops API/JSON Ops.md
-      - Synalinks API/Ops API/Language Models Ops.md
-      - Synalinks API/Ops API/Embedding Models Ops.md
     - Optimizers API:
       - Synalinks API/Optimizers API/index.md
       - Synalinks API/Optimizers API/Base Optimizer class.md
@@ -176,23 +245,250 @@ nav:
       - Synalinks API/Metrics/index.md
       - Synalinks API/Metrics/Base Metric class.md
       - Synalinks API/Metrics/Metric wrappers and reduction metrics.md
-      - Synalinks API/Metrics/Regression metrics.md
+      - Synalinks API/Metrics/Accuracy metrics.md
+      - Synalinks API/Metrics/Precision and Recall metrics.md
       - Synalinks API/Metrics/FScore metrics.md
+      - Synalinks API/Metrics/Regression metrics.md
+      - Synalinks API/Metrics/Language Model operational metrics.md
+      - Synalinks API/Metrics/Embedding Model operational metrics.md
+      - Synalinks API/Metrics/Program operational metrics.md
+      - Synalinks API/Metrics/Accuracy metric.md
+      - Synalinks API/Metrics/BinaryAccuracy metric.md
+      - Synalinks API/Metrics/CategoricalAccuracy metric.md
+      - Synalinks API/Metrics/GapK metric.md
+      - Synalinks API/Metrics/PassAtK metric.md
+      - Synalinks API/Metrics/PassHatK metric.md
+      - Synalinks API/Metrics/BatchMetric metric.md
+      - Synalinks API/Metrics/AvgEmbeddingCachedTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgEmbeddingCostPerCall metric.md
+      - Synalinks API/Metrics/AvgEmbeddingLatency metric.md
+      - Synalinks API/Metrics/AvgEmbeddingTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgEmbeddingVectorsPerCall metric.md
+      - Synalinks API/Metrics/AvgOptimizerEmbeddingCachedTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgOptimizerEmbeddingCostPerCall metric.md
+      - Synalinks API/Metrics/AvgOptimizerEmbeddingLatency metric.md
+      - Synalinks API/Metrics/AvgOptimizerEmbeddingTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgOptimizerEmbeddingVectorsPerCall metric.md
+      - Synalinks API/Metrics/AvgRewardEmbeddingCachedTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgRewardEmbeddingCostPerCall metric.md
+      - Synalinks API/Metrics/AvgRewardEmbeddingLatency metric.md
+      - Synalinks API/Metrics/AvgRewardEmbeddingTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgRewardEmbeddingVectorsPerCall metric.md
+      - Synalinks API/Metrics/EmbeddingCacheHitRate metric.md
+      - Synalinks API/Metrics/EmbeddingCachedTokens metric.md
+      - Synalinks API/Metrics/EmbeddingCost metric.md
+      - Synalinks API/Metrics/EmbeddingErrorRate metric.md
+      - Synalinks API/Metrics/EmbeddingFailedCalls metric.md
+      - Synalinks API/Metrics/EmbeddingFallbackActivations metric.md
+      - Synalinks API/Metrics/EmbeddingModelOperationalMetric metric.md
+      - Synalinks API/Metrics/EmbeddingModelOptimizersOperationalMetric metric.md
+      - Synalinks API/Metrics/EmbeddingModelRewardsOperationalMetric metric.md
+      - Synalinks API/Metrics/EmbeddingThroughput metric.md
+      - Synalinks API/Metrics/EmbeddingTokens metric.md
+      - Synalinks API/Metrics/EmbeddingTokensPerSecond metric.md
+      - Synalinks API/Metrics/EmbeddingVectors metric.md
+      - Synalinks API/Metrics/EmbeddingVectorsPerSecond metric.md
+      - Synalinks API/Metrics/OptimizerEmbeddingCacheHitRate metric.md
+      - Synalinks API/Metrics/OptimizerEmbeddingCachedTokens metric.md
+      - Synalinks API/Metrics/OptimizerEmbeddingCost metric.md
+      - Synalinks API/Metrics/OptimizerEmbeddingErrorRate metric.md
+      - Synalinks API/Metrics/OptimizerEmbeddingFailedCalls metric.md
+      - Synalinks API/Metrics/OptimizerEmbeddingFallbackActivations metric.md
+      - Synalinks API/Metrics/OptimizerEmbeddingThroughput metric.md
+      - Synalinks API/Metrics/OptimizerEmbeddingTokens metric.md
+      - Synalinks API/Metrics/OptimizerEmbeddingTokensPerSecond metric.md
+      - Synalinks API/Metrics/OptimizerEmbeddingVectors metric.md
+      - Synalinks API/Metrics/OptimizerEmbeddingVectorsPerSecond metric.md
+      - Synalinks API/Metrics/RewardEmbeddingCacheHitRate metric.md
+      - Synalinks API/Metrics/RewardEmbeddingCachedTokens metric.md
+      - Synalinks API/Metrics/RewardEmbeddingCost metric.md
+      - Synalinks API/Metrics/RewardEmbeddingErrorRate metric.md
+      - Synalinks API/Metrics/RewardEmbeddingFailedCalls metric.md
+      - Synalinks API/Metrics/RewardEmbeddingFallbackActivations metric.md
+      - Synalinks API/Metrics/RewardEmbeddingThroughput metric.md
+      - Synalinks API/Metrics/RewardEmbeddingTokens metric.md
+      - Synalinks API/Metrics/RewardEmbeddingTokensPerSecond metric.md
+      - Synalinks API/Metrics/RewardEmbeddingVectors metric.md
+      - Synalinks API/Metrics/RewardEmbeddingVectorsPerSecond metric.md
+      - Synalinks API/Metrics/BinaryF1Score metric.md
+      - Synalinks API/Metrics/BinaryFBetaScore metric.md
+      - Synalinks API/Metrics/CategoricalF1Score metric.md
+      - Synalinks API/Metrics/ListF1Score metric.md
+      - Synalinks API/Metrics/CategoricalFBetaScore metric.md
+      - Synalinks API/Metrics/ListFBetaScore metric.md
+      - Synalinks API/Metrics/F1Score metric.md
+      - Synalinks API/Metrics/FBetaScore metric.md
+      - Synalinks API/Metrics/AvgCacheCreationTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgCachedTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgCostPerCall metric.md
+      - Synalinks API/Metrics/AvgInputTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgLatency metric.md
+      - Synalinks API/Metrics/AvgOptimizerCacheCreationTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgOptimizerCachedTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgOptimizerCostPerCall metric.md
+      - Synalinks API/Metrics/AvgOptimizerInputTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgOptimizerLatency metric.md
+      - Synalinks API/Metrics/AvgOptimizerOutputTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgOptimizerReasoningTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgOptimizerTotalTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgOutputTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgReasoningTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgRewardCacheCreationTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgRewardCachedTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgRewardCostPerCall metric.md
+      - Synalinks API/Metrics/AvgRewardInputTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgRewardLatency metric.md
+      - Synalinks API/Metrics/AvgRewardOutputTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgRewardReasoningTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgRewardTotalTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgTimeToFirstToken metric.md
+      - Synalinks API/Metrics/AvgTimeToLastToken metric.md
+      - Synalinks API/Metrics/AvgTotalTokensPerCall metric.md
+      - Synalinks API/Metrics/AvgTrajectoryTimeToFirstToken metric.md
+      - Synalinks API/Metrics/CacheCreationTokens metric.md
+      - Synalinks API/Metrics/CacheHitRate metric.md
+      - Synalinks API/Metrics/CachedTokens metric.md
+      - Synalinks API/Metrics/Cost metric.md
+      - Synalinks API/Metrics/ErrorRate metric.md
+      - Synalinks API/Metrics/FailedCalls metric.md
+      - Synalinks API/Metrics/FallbackActivations metric.md
+      - Synalinks API/Metrics/InputTokens metric.md
+      - Synalinks API/Metrics/LMOperationalMetric metric.md
+      - Synalinks API/Metrics/LMOptimizersOperationalMetric metric.md
+      - Synalinks API/Metrics/LMRewardsOperationalMetric metric.md
+      - Synalinks API/Metrics/OptimizerCacheCreationTokens metric.md
+      - Synalinks API/Metrics/OptimizerCacheHitRate metric.md
+      - Synalinks API/Metrics/OptimizerCachedTokens metric.md
+      - Synalinks API/Metrics/OptimizerCost metric.md
+      - Synalinks API/Metrics/OptimizerErrorRate metric.md
+      - Synalinks API/Metrics/OptimizerFailedCalls metric.md
+      - Synalinks API/Metrics/OptimizerFallbackActivations metric.md
+      - Synalinks API/Metrics/OptimizerInputTokens metric.md
+      - Synalinks API/Metrics/OptimizerOutputTokens metric.md
+      - Synalinks API/Metrics/OptimizerReasoningTokenShare metric.md
+      - Synalinks API/Metrics/OptimizerReasoningTokens metric.md
+      - Synalinks API/Metrics/OptimizerThroughput metric.md
+      - Synalinks API/Metrics/OptimizerTokensPerSecond metric.md
+      - Synalinks API/Metrics/OptimizerTotalTokens metric.md
+      - Synalinks API/Metrics/OutputTokens metric.md
+      - Synalinks API/Metrics/ReasoningTokenShare metric.md
+      - Synalinks API/Metrics/ReasoningTokens metric.md
+      - Synalinks API/Metrics/RewardCacheCreationTokens metric.md
+      - Synalinks API/Metrics/RewardCacheHitRate metric.md
+      - Synalinks API/Metrics/RewardCachedTokens metric.md
+      - Synalinks API/Metrics/RewardCost metric.md
+      - Synalinks API/Metrics/RewardErrorRate metric.md
+      - Synalinks API/Metrics/RewardFailedCalls metric.md
+      - Synalinks API/Metrics/RewardFallbackActivations metric.md
+      - Synalinks API/Metrics/RewardInputTokens metric.md
+      - Synalinks API/Metrics/RewardOutputTokens metric.md
+      - Synalinks API/Metrics/RewardReasoningTokenShare metric.md
+      - Synalinks API/Metrics/RewardReasoningTokens metric.md
+      - Synalinks API/Metrics/RewardThroughput metric.md
+      - Synalinks API/Metrics/RewardTokensPerSecond metric.md
+      - Synalinks API/Metrics/RewardTotalTokens metric.md
+      - Synalinks API/Metrics/Throughput metric.md
+      - Synalinks API/Metrics/TokensPerSecond metric.md
+      - Synalinks API/Metrics/TotalTokens metric.md
+      - Synalinks API/Metrics/Metric metric.md
+      - Synalinks API/Metrics/BinaryPrecision metric.md
+      - Synalinks API/Metrics/BinaryRecall metric.md
+      - Synalinks API/Metrics/CategoricalPrecision metric.md
+      - Synalinks API/Metrics/CategoricalRecall metric.md
+      - Synalinks API/Metrics/Precision metric.md
+      - Synalinks API/Metrics/Recall metric.md
+      - Synalinks API/Metrics/ProgramAvgCostPerInvocation metric.md
+      - Synalinks API/Metrics/ProgramCalls metric.md
+      - Synalinks API/Metrics/ProgramCallsPerSecond metric.md
+      - Synalinks API/Metrics/ProgramCost metric.md
+      - Synalinks API/Metrics/ProgramElapsedTime metric.md
+      - Synalinks API/Metrics/ProgramOperationalMetric metric.md
+      - Synalinks API/Metrics/Mean metric.md
+      - Synalinks API/Metrics/MeanMetricWrapper metric.md
+      - Synalinks API/Metrics/Sum metric.md
+      - Synalinks API/Metrics/CosineSimilarity metric.md
     - Rewards:
       - Synalinks API/Rewards/index.md
+      - Synalinks API/Rewards/Base Reward class.md
       - Synalinks API/Rewards/ExactMatch reward.md
       - Synalinks API/Rewards/CosineSimilarity reward.md
       - Synalinks API/Rewards/LMAsJudge reward.md
+      - Synalinks API/Rewards/AgentAsJudge reward.md
+      - Synalinks API/Rewards/RLMAsJudge reward.md
+      - Synalinks API/Rewards/DeepAgentAsJudge reward.md
+      - Synalinks API/Rewards/RubricsAsJudge reward.md
+      - Synalinks API/Rewards/ComposableReward reward.md
+      - Synalinks API/Rewards/Rubric preset rewards.md
+      - Synalinks API/Rewards/AnswerRelevancy reward.md
+      - Synalinks API/Rewards/Faithfulness reward.md
+      - Synalinks API/Rewards/Hallucination reward.md
+      - Synalinks API/Rewards/Summarization reward.md
+      - Synalinks API/Rewards/ArgumentCorrectness reward.md
+      - Synalinks API/Rewards/ContextualRelevancy reward.md
+      - Synalinks API/Rewards/ContextualPrecision reward.md
+      - Synalinks API/Rewards/ContextualRecall reward.md
+      - Synalinks API/Rewards/CitationFaithfulness reward.md
+      - Synalinks API/Rewards/Bias reward.md
+      - Synalinks API/Rewards/Toxicity reward.md
+      - Synalinks API/Rewards/PIILeakage reward.md
+      - Synalinks API/Rewards/Misuse reward.md
+      - Synalinks API/Rewards/NonAdvice reward.md
+      - Synalinks API/Rewards/PromptAlignment reward.md
+      - Synalinks API/Rewards/TaskCompletion reward.md
+      - Synalinks API/Rewards/ToolCorrectness reward.md
+      - Synalinks API/Rewards/ToolUse reward.md
+      - Synalinks API/Rewards/ToolPermission reward.md
+      - Synalinks API/Rewards/GoalAccuracy reward.md
+      - Synalinks API/Rewards/RoleAdherence reward.md
+      - Synalinks API/Rewards/RoleViolation reward.md
+      - Synalinks API/Rewards/PlanQuality reward.md
+      - Synalinks API/Rewards/PlanAdherence reward.md
+      - Synalinks API/Rewards/StepEfficiency reward.md
+      - Synalinks API/Rewards/AgentLoopDetection reward.md
+      - Synalinks API/Rewards/ConversationCompleteness reward.md
+      - Synalinks API/Rewards/KnowledgeRetention reward.md
+      - Synalinks API/Rewards/TopicAdherence reward.md
+      - Synalinks API/Rewards/TurnRelevancy reward.md
+      - Synalinks API/Rewards/TurnFaithfulness reward.md
+      - Synalinks API/Rewards/RewardFunctionWrapper reward.md
+      - Synalinks API/Rewards/ProgramAsJudge reward.md
+      - Synalinks API/Rewards/BatchReward reward.md
+      - Synalinks API/Rewards/BatchRewardFunctionWrapper reward.md
       - Synalinks API/Rewards/Reward wrappers.md
+      - Synalinks API/Rewards/Batch reward wrappers.md
+    - Datasets:
+      - Synalinks API/Datasets/Dataset.md
+      - Synalinks API/Datasets/HuggingFaceDataset.md
+      - Synalinks API/Datasets/MLflowDataset.md
+      - Synalinks API/Datasets/ImageFolderDataset.md
     - Built-in Datasets:
       - Synalinks API/Built-in Datasets/index.md
       - Synalinks API/Built-in Datasets/GSM8K.md
       - Synalinks API/Built-in Datasets/HotpotQA.md
       - Synalinks API/Built-in Datasets/ARC-AGI.md
+      - Synalinks API/Built-in Datasets/ARC-Challenge.md
+      - Synalinks API/Built-in Datasets/BBH.md
+      - Synalinks API/Built-in Datasets/BBQ.md
+      - Synalinks API/Built-in Datasets/BoolQ.md
+      - Synalinks API/Built-in Datasets/DROP.md
+      - Synalinks API/Built-in Datasets/HellaSwag.md
+      - Synalinks API/Built-in Datasets/HumanEval.md
+      - Synalinks API/Built-in Datasets/IFEval.md
+      - Synalinks API/Built-in Datasets/LAMBADA.md
+      - Synalinks API/Built-in Datasets/LogiQA.md
+      - Synalinks API/Built-in Datasets/MMLU.md
+      - Synalinks API/Built-in Datasets/SQuAD.md
+      - Synalinks API/Built-in Datasets/TruthfulQA.md
+      - Synalinks API/Built-in Datasets/WinoGrande.md
     - Utilities:
       - Synalinks API/Utilities/Program plotting utilities.md
       - Synalinks API/Utilities/More plotting utilities.md
       - Synalinks API/Utilities/NLP utilities.md
+    - Utils API:
+      - Synalinks API/Utils API.md
+      - Synalinks API/Utils/disable_keras_backend.md
+    - Synalinks API/Tuners.md
+    - Synalinks API/Observability API.md
     - Synalinks API/Config.md
   - Observability:
     - Observability/MLflow.md

@@ -1,9 +1,10 @@
 # Modified from: keras/src/trainers/trainer.py
 # Original authors: François Chollet et al. (Keras Team)
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import asyncio
 import inspect
+import json
 import warnings
 
 import numpy as np
@@ -12,7 +13,11 @@ from synalinks.src import backend
 from synalinks.src import callbacks as callbacks_module
 from synalinks.src import metrics as metrics_module
 from synalinks.src import optimizers as optimizers_module
+from synalinks.src import rewards as rewards_module
+from synalinks.src import tree
 from synalinks.src.backend.common import numpy
+from synalinks.src.backend.common.op_scope import PhaseClock
+from synalinks.src.backend.common.op_scope import op_scope
 from synalinks.src.saving import serialization_lib
 from synalinks.src.trainers.compile_utils import CompileMetrics
 from synalinks.src.trainers.compile_utils import CompileReward
@@ -22,6 +27,119 @@ from synalinks.src.trainers.epoch_iterator import EpochIterator
 from synalinks.src.utils import python_utils
 from synalinks.src.utils import tracking
 from synalinks.src.utils.async_utils import run_maybe_nested
+
+
+def _clone_metric(metric):
+    """Return a fresh instance of `metric` with independent state.
+
+    Reconstructs the metric from its own config so a brand-new backend
+    ``Variable`` set (and, for operational metrics, an unbound model list) is
+    created -- true per-program isolation, not a shared-state view. Config
+    values that reference objects (e.g. a wrapped callable in
+    ``MeanMetricWrapper``) are carried over BY REFERENCE, never deep-copied, so
+    a metric wrapping a reward that holds a `LanguageModel` doesn't duplicate
+    that model.
+
+    Most metrics round-trip cleanly through ``from_config(get_config())``. The
+    one gap is a metric wrapping a *bare* callable the serialization registry
+    can't locate (e.g. a user's plain function passed to
+    ``MeanMetricWrapper``); that case is rebuilt directly, preserving the
+    callable by reference.
+    """
+    try:
+        return type(metric).from_config(metric.get_config())
+    except Exception:
+        if isinstance(metric, metrics_module.MeanMetricWrapper):
+            return type(metric)(
+                fn=metric._fn,
+                name=metric.name,
+                in_mask=metric.in_mask,
+                out_mask=metric.out_mask,
+                in_mask_pattern=metric.in_mask_pattern,
+                out_mask_pattern=metric.out_mask_pattern,
+                **metric._fn_kwargs,
+            )
+        raise
+
+
+def _own_metrics(metrics):
+    """Return `metrics` with every metric instance replaced by a fresh clone.
+
+    `compile()` takes ownership of its metrics (as Keras does): each program
+    gets its OWN metric instances so nothing is shared across programs. This
+    matters whenever one metrics list is reused across several programs -- the
+    natural thing to do for every trial of a tuner sweep -- where two distinct
+    kinds of leakage would otherwise occur:
+
+      * operational metrics (`TotalTokens`, `Cost`, ...) bind to a program's
+        `LanguageModel`/`EmbeddingModel` on compile; a shared instance ends up
+        bound to whichever program compiled LAST, so every earlier program
+        reads the wrong model's counters;
+      * ordinary metrics (`MeanMetricWrapper`, `Accuracy`, ...) accumulate
+        state; a shared instance is reset per program only via its own
+        lazily-built `CompileMetrics`, so state from one program leaks into the
+        next.
+
+    Cloning per compile removes both at the root. String / callable identifiers
+    are left untouched -- they're resolved into a fresh metric per program by
+    `CompileMetrics` anyway, so they're already isolated.
+    """
+    if metrics is None:
+        return None
+
+    def clone(m):
+        if isinstance(m, metrics_module.Metric):
+            return _clone_metric(m)
+        return m
+
+    return tree.map_structure(clone, metrics)
+
+
+def _target_key(target):
+    """A hashable key identifying a target's value, for stratification."""
+    value = target.get_json() if hasattr(target, "get_json") else target
+    try:
+        return json.dumps(value, sort_keys=True, default=str)
+    except TypeError:
+        return repr(value)
+
+
+def stratified_minibatch_indices(y, size, rng=None):
+    """Indices of a validation minibatch that spans the target classes.
+
+    Samples are grouped by target value and drawn round-robin across the
+    groups (groups and their members in random order), so a minibatch of
+    `size` covers up to `size` distinct targets instead of a random draw that
+    may fall on a single class. When targets do not repeat (every sample has
+    its own target, e.g. free text) or all are identical, this is a plain
+    random draw without replacement.
+
+    Args:
+        y (array-like): The targets, one per sample.
+        size (int): Number of indices to draw (capped at `len(y)`).
+        rng (np.random.Generator): Optional random generator.
+
+    Returns:
+        (np.ndarray): The selected indices, in draw order.
+    """
+    rng = rng if rng is not None else np.random.default_rng()
+    n = len(y)
+    size = min(int(size), n)
+    if size <= 0:
+        return np.array([], dtype=int)
+    groups = {}
+    for index in range(n):
+        groups.setdefault(_target_key(y[index]), []).append(index)
+    if len(groups) <= 1 or len(groups) == n:
+        return rng.choice(n, size=size, replace=False)
+    buckets = [list(rng.permutation(members)) for members in groups.values()]
+    rng.shuffle(buckets)
+    selected = []
+    while len(selected) < size:
+        for bucket in buckets:
+            if bucket and len(selected) < size:
+                selected.append(int(bucket.pop()))
+    return np.array(selected, dtype=int)
 
 
 class Trainer:
@@ -41,6 +159,11 @@ class Trainer:
         self._compile_reward = None
         self._compile_metrics = None
         self._reward_tracker = None
+        self._per_sample_rewards = None
+        # Wall-clock per phase for this program only: the throughput metrics'
+        # denominator. Kept per program so programs evaluated concurrently on
+        # one event loop don't share (and corrupt) a single clock.
+        self._phase_clock = PhaseClock()
 
     @tracking.no_automatic_dependency_tracking
     def compile(
@@ -76,6 +199,16 @@ class Trainer:
                 `y_true` should be a list of batch size length `[d0, .. dN]`.
                 `y_pred` should be a list of batch size length `[d0, .. dN]`.
                 The reward function should return a float.
+                A bare function can be passed directly: it is auto-wrapped in a
+                `synalinks.rewards.RewardFunctionWrapper` named after the
+                function. Wrap it yourself only when you need masks, a custom
+                `reduction`, or extra keyword arguments forwarded to it.
+                It must be declared with `async def`, since reward functions
+                are awaited; a synchronous one raises a `TypeError`.
+                Batched functions are never auto-wrapped, because a
+                `batch -> list[float]` signature cannot be told apart from a
+                per-sample one at that point: pass those as an explicit
+                `synalinks.rewards.BatchRewardFunctionWrapper`.
             reward_weights (list): Optional list specifying scalar coefficients
                 (Python floats) to weight the reward contributions of
                 different program outputs. The reward value that will be maximized
@@ -103,24 +236,47 @@ class Trainer:
                 each compiled function execution).
         """
         self._clear_previous_trainer_metrics()
-        self._optimizer = optimizer
-        self._optimizer.set_program(self)
+        # Resolve string/dict identifiers (Keras-style) into instances.
+        # Reward and metrics flow through `CompileReward`/`CompileMetrics`
+        # which already call `rewards.get` / `metrics.get`.
+        self._optimizer = optimizers_module.get(optimizer)
+        if self._optimizer is not None:
+            self._optimizer.set_program(self)
 
         if hasattr(self, "output_names"):
             output_names = self.output_names
         else:
             output_names = None
         if reward is not None:
+            reward = rewards_module.get(reward)
+            reduction = getattr(reward, "reduction", "mean")
             self._compile_reward = CompileReward(
-                reward, reward_weights, output_names=output_names
+                reward,
+                reward_weights,
+                reduction=reduction,
+                output_names=output_names,
             )
             self.reward = reward
         if metrics is not None:
+            # Take ownership: clone every metric instance so each program has
+            # its own (see `_own_metrics`). The same clones flow into
+            # `CompileMetrics` and the bind loop below, so results are read from
+            # exactly the instances bound here.
+            metrics = _own_metrics(metrics)
             self._compile_metrics = CompileMetrics(metrics, output_names=output_names)
+            # Operational metrics (e.g. TotalTokens, Throughput) accept
+            # `language_model=None`; bind them to every LM reachable from
+            # the program so counters aggregate automatically.
+            for m in tree.flatten(metrics):
+                if hasattr(m, "bind_program"):
+                    m.bind_program(self)
         self.run_eagerly = run_eagerly
         self.stop_training = False
         self.compiled = True
         self._reward_tracker = metrics_module.Mean(name="reward")
+        # Rewards are maximized: lets callbacks resolve `mode="auto"` for
+        # `reward` / `val_reward` without an explicit `mode`.
+        self._reward_tracker.direction = "up"
         self.steps_per_execution = steps_per_execution
 
         self._compile_config = serialization_lib.SerializableDict(
@@ -227,23 +383,26 @@ class Trainer:
         del x
         del training
         rewards = []
-        if self._compile_reward is not None:
-            results = await asyncio.gather(
-                *[
-                    self._compile_reward(y_t, y_p)
-                    for y_t, y_p in zip(y, y_pred)
-                ]
-            )
-            for reward in results:
-                if reward is not None:
-                    rewards.append(float(reward))
+        with op_scope("reward", clock=self._phase_clock):
+            if self._compile_reward is not None:
+                if not self._compile_reward.built:
+                    self._compile_reward.build(y[0], y_pred[0])
+                if self._compile_reward.has_batch_rewards:
+                    results = await self._compile_reward.compute_batch(y, y_pred)
                 else:
-                    rewards.append(0.0)
-        for reward in self.rewards:
-            rewards.append(float(numpy.sum(reward)))
-        if len(rewards) == 0:
-            rewards = [0.0]
-        return rewards
+                    results = await asyncio.gather(
+                        *[self._compile_reward(y_t, y_p) for y_t, y_p in zip(y, y_pred)]
+                    )
+                for reward in results:
+                    if reward is not None:
+                        rewards.append(float(reward))
+                    else:
+                        rewards.append(0.0)
+            for reward in self.rewards:
+                rewards.append(float(numpy.sum(reward)))
+            if len(rewards) == 0:
+                rewards = [0.0]
+            return rewards
 
     def stateless_compute_reward(
         self,
@@ -307,8 +466,9 @@ class Trainer:
         """
         del x  # The default implementation does not use `x`.
         if self._compile_metrics is not None:
-            for y_t, y_p in zip(y, y_pred):
-                await self._compile_metrics.update_state(y_t, y_p)
+            # Feed the whole batch: `BatchMetric`s (e.g. `PassAtK`) consume it
+            # at once, ordinary metrics are still updated per-sample.
+            await self._compile_metrics.update_state_batch(y, y_pred)
         return self.get_metrics_result()
 
     def get_metrics_result(self):
@@ -367,8 +527,10 @@ class Trainer:
                 Do not specify the `batch_size` if your input data `x` is a
                 Python generator function since they generate batches.
             minibatch_size (int): Integer or `None`.
-                Number of randomly selected samples per batch validation.
-                If unspecified, `minibatch_size` will default to 4.
+                Number of validation samples drawn per training step to score
+                the candidates. The draw is stratified by target value when
+                targets repeat (see `stratified_minibatch_indices`), random
+                otherwise. If unspecified, `minibatch_size` will default to 4.
                 If `None`, the whole validation set will be used.
             epochs (int): Integer. Number of epochs to train the program.
                 An epoch is an iteration over the entire `x` and `y`
@@ -458,7 +620,27 @@ class Trainer:
         """
         self._assert_compile_called("fit")
         self._eval_epoch_iterator = None
-        val_y, val_y = None, None
+        val_x, val_y = None, None
+
+        if self._optimizer is None:
+            # No optimizer ⇒ no parameter updates possible. Iterating the
+            # training loop here would just burn LM calls / wall-clock time
+            # without changing anything. Warn loudly and return an empty
+            # History so callers that inspect `.history` keep working.
+            warnings.warn(
+                "`Program.fit()` was called but no optimizer is set on the "
+                "compiled program; training cannot update any variables, so "
+                "iterating the training data would be wasted compute. "
+                "Skipping the fit loop. If you intended to evaluate, call "
+                "`program.evaluate(x=..., y=...)` directly. If you intended "
+                "to train, recompile with an optimizer (e.g. "
+                "`program.compile(optimizer=synalinks.optimizers.RandomFewShot(), "
+                "reward=..., metrics=...)`).",
+                stacklevel=2,
+            )
+            history = callbacks_module.History()
+            self.history = history
+            return history
 
         if validation_split and validation_data is None:
             # Create the validation data using the training data. Only supported
@@ -503,13 +685,29 @@ class Trainer:
                 add_progbar=verbose != 0,
                 verbose=verbose,
                 epochs=epochs,
-                steps=steps_per_epoch,
+                steps=steps_per_epoch or epoch_iterator.num_batches,
                 batch_size=batch_size,
+                minibatch_size=minibatch_size,
                 optimizer=optimizer_name,
+                validation_split=validation_split if validation_data is None else 0,
+                validation_freq=validation_freq,
+                validation_batch_size=validation_batch_size,
+                validation_steps=validation_steps,
+                initial_epoch=initial_epoch,
+                train_size=len(x) if hasattr(x, "__len__") else None,
+                val_size=len(val_x) if validation_data is not None else 0,
                 program=self,
             )
 
         self.stop_training = False
+        # Exposed to callbacks (e.g. `callbacks.Monitor` logs them as MLflow
+        # dataset inputs) for the duration of the training loop.
+        self._fit_inputs = {
+            "x": x,
+            "y": y,
+            "val_x": val_x if validation_data is not None else None,
+            "val_y": val_y if validation_data is not None else None,
+        }
         callbacks.on_train_begin()
         training_logs = None
         logs = {}
@@ -554,10 +752,9 @@ class Trainer:
                     mini_val_y = None
                     if minibatch_size:
                         if len(val_x) > minibatch_size:
-                            indices = np.random.choice(
-                                len(val_x),
-                                size=minibatch_size,
-                                replace=False,
+                            indices = stratified_minibatch_indices(
+                                val_y,
+                                minibatch_size,
                             )
                             mini_val_x = val_x[indices]
                             mini_val_y = val_y[indices]
@@ -569,15 +766,6 @@ class Trainer:
                         val_x=mini_val_x if mini_val_x is not None else val_x,
                         val_y=mini_val_y if mini_val_y is not None else val_y,
                         return_dict=True,
-                    )
-
-                    val_logs = await self.evaluate(
-                        x=val_x,
-                        y=val_y,
-                        batch_size=validation_batch_size or batch_size,
-                        steps=validation_steps,
-                        callbacks=callbacks,
-                        _use_cached_eval_dataset=False,
                     )
 
                     if self.trainable_variables and isinstance(
@@ -626,6 +814,8 @@ class Trainer:
                 await self.optimizer.on_epoch_end(
                     epoch,
                     self.trainable_variables,
+                    logs=epoch_logs,
+                    val_size=len(val_x) if val_x is not None else None,
                 )
 
             callbacks.on_epoch_end(epoch, epoch_logs)
@@ -643,6 +833,7 @@ class Trainer:
             await self.optimizer.on_train_end(self.trainable_variables)
 
         callbacks.on_train_end(logs=training_logs)
+        self._fit_inputs = None
         return self.history
 
     async def evaluate(
@@ -718,11 +909,18 @@ class Trainer:
                 steps_per_execution=self.steps_per_execution,
             )
 
+        # Building calls the program for real on the first batch. That batch is
+        # the first one this evaluation is about to score anyway — the iterator
+        # is unshuffled and rewound below — so the build's predictions are kept
+        # and handed to the first `test_on_batch` instead of being dropped and
+        # recomputed. Nothing is skipped either way; the difference is one
+        # forward pass, which for an agent program is a whole agent run.
+        prebuilt_y_pred = None
         if not all(module.built for module in self._flatten_modules()):
             # Build the model on one batch of data.
             for _, data in epoch_iterator:
                 data_batch = data[0]
-                self._auto_build(
+                prebuilt_y_pred = self._auto_build(
                     iterator=epoch_iterator,
                     data_batch=data_batch,
                 )
@@ -738,10 +936,13 @@ class Trainer:
                 verbose=verbose,
                 epochs=1,
                 steps=epoch_iterator.num_batches,
+                batch_size=batch_size,
+                test_size=len(x) if hasattr(x, "__len__") else None,
                 program=self,
             )
 
         self.stop_evaluating = False
+        self._eval_inputs = {"x": x, "y": y}
         callbacks.on_test_begin()
         logs = {}
         self.reset_metrics()
@@ -749,16 +950,21 @@ class Trainer:
             callbacks.on_test_batch_begin(step)
             data = iterator[0]
             x_batch, y_batch = data_adapter_utils.unpack_x_y(data)
+            # Only the first step can consume the auto-build's predictions, and
+            # only once: taking it clears it, so every later batch predicts.
+            y_pred, prebuilt_y_pred = prebuilt_y_pred, None
             logs = await self.test_on_batch(
                 x=x_batch,
                 y=y_batch,
                 return_dict=True,
+                y_pred=y_pred,
             )
             callbacks.on_test_batch_end(step, logs)
             if self.stop_evaluating:
                 break
         logs = self.get_metrics_result()
         callbacks.on_test_end(logs)
+        self._eval_inputs = None
 
         if return_dict:
             return logs
@@ -828,11 +1034,11 @@ class Trainer:
                 verbose=verbose,
                 epochs=1,
                 steps=epoch_iterator.num_batches,
-                model=self,
+                program=self,
             )
 
         self.stop_predicting = False
-        callbacks.on_test_begin()
+        callbacks.on_predict_begin()
         outputs = []
         for step, iterator in epoch_iterator:
             callbacks.on_predict_batch_begin(step)
@@ -876,14 +1082,15 @@ class Trainer:
         if self.trainable_variables and isinstance(
             self.optimizer, optimizers_module.Optimizer
         ):
-            metrics = await self.optimizer.optimize(
-                step,
-                self.trainable_variables,
-                x=x,
-                y=y,
-                val_x=val_x,
-                val_y=val_y,
-            )
+            with op_scope("optimizer", clock=self._phase_clock):
+                metrics = await self.optimizer.optimize(
+                    step,
+                    self.trainable_variables,
+                    x=x,
+                    y=y,
+                    val_x=val_x,
+                    val_y=val_y,
+                )
         else:
             warnings.warn("The program does not have any trainable variables.")
             y_pred = await self.predict_on_batch(val_x)
@@ -892,8 +1099,13 @@ class Trainer:
                 y=val_y,
                 y_pred=y_pred,
             )
-            mean_reward = float(numpy.mean(rewards))
-            await self._reward_tracker.update_state(mean_reward)
+            reduction = (
+                self._compile_reward.reduction
+                if self._compile_reward is not None
+                else "mean"
+            )
+            scalar_reward = rewards_module.reduce_rewards(rewards, reduction)
+            await self._reward_tracker.update_state(scalar_reward)
             metrics = await self.compute_metrics(val_x, val_y, y_pred)
 
         if return_dict:
@@ -905,6 +1117,7 @@ class Trainer:
         x,
         y=None,
         return_dict=False,
+        y_pred=None,
     ):
         """Test the program on a single batch of samples.
 
@@ -914,6 +1127,13 @@ class Trainer:
             return_dict (bool): If `True`, reward and metric results are returned as a
                 dict, with each key being the name of the metric. If `False`,
                 they are returned as a list.
+            y_pred (list): Optional predictions for `x`, already computed by an
+                earlier forward pass. When given, the program is not called
+                again — see `evaluate`, which reuses the prediction its
+                auto-build pass produced for the first batch. Passing
+                predictions that are not the program's own output for `x` will
+                silently report rewards and metrics for something the program
+                never predicted.
 
         Returns:
             (float | list | dict): A scalar reward value
@@ -921,7 +1141,8 @@ class Trainer:
                 and metric values (if there are metrics and `return_dict=False`),
                 or a dict of metric and reward values (if `return_dict=True`).
         """
-        y_pred = await self.predict_on_batch(x)
+        if y_pred is None:
+            y_pred = await self.predict_on_batch(x)
 
         rewards = await self.compute_reward(
             x=x,
@@ -929,8 +1150,15 @@ class Trainer:
             y_pred=y_pred,
             training=False,
         )
-        mean_reward = float(numpy.mean(rewards))
-        await self._reward_tracker.update_state(mean_reward)
+        # Per-sample rewards of the last test batch, read by callbacks
+        # (e.g. `callbacks.Monitor` logs them as per-trace assessments).
+        self._per_sample_rewards = list(rewards)
+        self._per_sample_targets = [t.get_json() for t in y] if y is not None else None
+        reduction = (
+            self._compile_reward.reduction if self._compile_reward is not None else "mean"
+        )
+        scalar_reward = rewards_module.reduce_rewards(rewards, reduction)
+        await self._reward_tracker.update_state(scalar_reward)
 
         metrics = await self.compute_metrics(x, y, y_pred)
 
@@ -948,11 +1176,16 @@ class Trainer:
         Returns:
             (list): list(s) of JsonDataModel predictions.
         """
-        tasks = []
-        for inputs in x:
-            tasks.append(self(inputs, training=training))
-        y_pred = await asyncio.gather(*tasks)
-        return y_pred
+        # Tag this work as "inference" so LanguageModel / EmbeddingModel can
+        # attribute token / latency / cost to the program's forward pass
+        # only. See synalinks.src.backend.common.op_scope; the active phase
+        # is one of "inference", "reward", "optimizer", or None.
+        with op_scope("inference", clock=self._phase_clock):
+            tasks = []
+            for inputs in x:
+                tasks.append(self(inputs, training=training))
+            y_pred = await asyncio.gather(*tasks)
+            return y_pred
 
     def get_compile_config(self):
         """Returns a serialized config with information for compiling the program.
@@ -1066,6 +1299,20 @@ class Trainer:
             raise ValueError(msg)
 
     def _auto_build(self, iterator=None, data_batch=None):
+        """Build the program, its metrics, its reward and its optimizer.
+
+        Building the program means calling it: a program's output schema is
+        not knowable without running it, so this does one real forward pass on
+        `data_batch`. That pass is as expensive as any other — for an agent
+        program it is a full agent run, LM calls and all — so the predictions
+        it produces are returned rather than dropped, letting a caller that is
+        about to evaluate the very same batch reuse them.
+
+        Returns:
+            (list | None): The predictions for `data_batch`'s inputs, or None
+                when nothing needed building and no forward pass was made.
+        """
+        y_pred = None
         program_unbuilt = not all(module.built for module in self._flatten_modules())
         compile_metrics_unbuilt = (
             self._compile_metrics is not None and not self._compile_metrics.built
@@ -1122,6 +1369,7 @@ class Trainer:
             # Build optimizer
             run_maybe_nested(self.optimizer.build(self.trainable_variables))
         self._post_build()
+        return y_pred
 
     def _assert_compile_called(self, method_name=None):
         if not self.compiled:

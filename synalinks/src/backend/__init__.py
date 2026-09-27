@@ -11,11 +11,11 @@ if backend() == "pydantic":
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend.common import name_scope
 from synalinks.src.backend.common.dynamic_json_schema_utils import dynamic_enum
+from synalinks.src.backend.common.dynamic_json_schema_utils import dynamic_enum_array
 from synalinks.src.backend.common.dynamic_json_schema_utils import dynamic_tool_calls
 from synalinks.src.backend.common.dynamic_json_schema_utils import dynamic_tool_choice
 from synalinks.src.backend.common.json_schema_utils import concatenate_schema
 from synalinks.src.backend.common.json_schema_utils import contains_schema
-from synalinks.src.backend.common.json_schema_utils import decompose_schema
 from synalinks.src.backend.common.json_schema_utils import factorize_schema
 from synalinks.src.backend.common.json_schema_utils import in_mask_schema
 from synalinks.src.backend.common.json_schema_utils import is_schema_equal
@@ -24,7 +24,6 @@ from synalinks.src.backend.common.json_schema_utils import prefix_schema
 from synalinks.src.backend.common.json_schema_utils import standardize_schema
 from synalinks.src.backend.common.json_schema_utils import suffix_schema
 from synalinks.src.backend.common.json_utils import concatenate_json
-from synalinks.src.backend.common.json_utils import decompose_json
 from synalinks.src.backend.common.json_utils import factorize_json
 from synalinks.src.backend.common.json_utils import in_mask_json
 from synalinks.src.backend.common.json_utils import out_mask_json
@@ -40,10 +39,8 @@ from synalinks.src.backend.common.symbolic_scope import SymbolicScope
 if backend() == "pydantic":
     from pydantic import Field
 
-    from synalinks.src.backend.pydantic.base import ChatMessage
-    from synalinks.src.backend.pydantic.base import ChatMessages
-    from synalinks.src.backend.pydantic.base import ChatRole
     from synalinks.src.backend.pydantic.base import Embedding
+    from synalinks.src.backend.pydantic.base import EmbeddingRequest
     from synalinks.src.backend.pydantic.base import Embeddings
     from synalinks.src.backend.pydantic.base import GenericInputs
     from synalinks.src.backend.pydantic.base import GenericIO
@@ -51,26 +48,54 @@ if backend() == "pydantic":
     from synalinks.src.backend.pydantic.base import GenericResult
     from synalinks.src.backend.pydantic.base import Instructions
     from synalinks.src.backend.pydantic.base import Prediction
-    from synalinks.src.backend.pydantic.base import Score
     from synalinks.src.backend.pydantic.base import Stamp
-    from synalinks.src.backend.pydantic.base import ToolCall
     from synalinks.src.backend.pydantic.base import Trainable
-    from synalinks.src.backend.pydantic.base import is_chat_message
-    from synalinks.src.backend.pydantic.base import is_chat_messages
     from synalinks.src.backend.pydantic.base import is_embedded
     from synalinks.src.backend.pydantic.base import is_embedding
     from synalinks.src.backend.pydantic.base import is_embeddings
     from synalinks.src.backend.pydantic.base import is_instructions
     from synalinks.src.backend.pydantic.base import is_prediction
     from synalinks.src.backend.pydantic.base import is_stamped
-    from synalinks.src.backend.pydantic.base import is_tool_call
     from synalinks.src.backend.pydantic.base import is_trainable
+    from synalinks.src.backend.pydantic.common import ChatMessage
+    from synalinks.src.backend.pydantic.common import ChatMessages
+    from synalinks.src.backend.pydantic.common import ChatRole
+    from synalinks.src.backend.pydantic.common import ToolCall
+    from synalinks.src.backend.pydantic.common import is_chat_message
+    from synalinks.src.backend.pydantic.common import is_chat_messages
+    from synalinks.src.backend.pydantic.common import is_strictly_chat_message
+    from synalinks.src.backend.pydantic.common import is_strictly_chat_messages
+    from synalinks.src.backend.pydantic.common import is_tool_call
     from synalinks.src.backend.pydantic.core import IS_THREAD_SAFE
     from synalinks.src.backend.pydantic.core import DataModel as BackendDataModel
     from synalinks.src.backend.pydantic.core import any_data_model
     from synalinks.src.backend.pydantic.core import any_meta_class
     from synalinks.src.backend.pydantic.core import is_data_model
     from synalinks.src.backend.pydantic.core import is_meta_class
+    from synalinks.src.backend.pydantic.knowledge import EmbeddedEntity
+    from synalinks.src.backend.pydantic.knowledge import Entities
+    from synalinks.src.backend.pydantic.knowledge import Entity
+    from synalinks.src.backend.pydantic.knowledge import KnowledgeGraph
+    from synalinks.src.backend.pydantic.knowledge import KnowledgeGraphs
+    from synalinks.src.backend.pydantic.knowledge import Relation
+    from synalinks.src.backend.pydantic.knowledge import Relations
+    from synalinks.src.backend.pydantic.knowledge import is_embedded_entity
+    from synalinks.src.backend.pydantic.knowledge import is_entities
+    from synalinks.src.backend.pydantic.knowledge import is_entity
+    from synalinks.src.backend.pydantic.knowledge import is_knowledge_graph
+    from synalinks.src.backend.pydantic.knowledge import is_knowledge_graphs
+    from synalinks.src.backend.pydantic.knowledge import is_relation
+    from synalinks.src.backend.pydantic.knowledge import is_relations
+    from synalinks.src.backend.pydantic.media import Audio
+    from synalinks.src.backend.pydantic.media import Image
+    from synalinks.src.backend.pydantic.media import resolve_content_media
+    from synalinks.src.backend.pydantic.metrics import FineScore
+    from synalinks.src.backend.pydantic.metrics import Rating
+    from synalinks.src.backend.pydantic.metrics import Rating10
+    from synalinks.src.backend.pydantic.metrics import Rating20
+    from synalinks.src.backend.pydantic.metrics import Score
+    from synalinks.src.backend.pydantic.metrics import get_score_type
+    from synalinks.src.backend.pydantic.metrics import normalize_score
     from synalinks.src.backend.pydantic.module import PydanticModule
 else:
     raise ValueError(f"Unable to import backend : {backend()}")

@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import re
 
@@ -12,10 +12,46 @@ from synalinks.src.backend import ChatRole
 from synalinks.src.backend import Instructions
 from synalinks.src.backend import Prediction
 from synalinks.src.backend import SymbolicDataModel
+from synalinks.src.backend import is_chat_messages
+from synalinks.src.backend import is_strictly_chat_message
+from synalinks.src.backend import is_strictly_chat_messages
+from synalinks.src.backend.common.op_scope import current_op_scope
+from synalinks.src.modules.decision_models import resolve_decision_model
+from synalinks.src.modules.decision_models.decision_model import UnsupportedSchemaError
+from synalinks.src.modules.language_models import get as _get_lm
+from synalinks.src.modules.language_models.language_model import StreamingIterator
+from synalinks.src.modules.language_models.language_model import _tool_to_wire
 from synalinks.src.modules.module import Module
 from synalinks.src.saving import serialization_lib
 
-ROLES = [ChatRole.SYSTEM, ChatRole.USER, ChatRole.ASSISTANT, ChatRole.TOOL]
+ROLES = [
+    ChatRole.SYSTEM,
+    ChatRole.USER,
+    ChatRole.ASSISTANT,
+    ChatRole.TOOL,
+    ChatRole.FUNCTION,
+]
+
+_SYSTEM_PROMPT_ROLES = {ChatRole.SYSTEM.value, ChatRole.DEVELOPER.value}
+
+
+def _as_tool_list(tools):
+    """Normalize `tools` (a list, a `{name: Tool}` mapping, or None) to a list."""
+    if not tools:
+        return []
+    if isinstance(tools, dict):
+        return list(tools.values())
+    return list(tools)
+
+
+def _tools_to_schemas(tools):
+    """Convert live `Tool` objects to OpenAI wire-format declaration dicts."""
+    return [_tool_to_wire(tool) for tool in _as_tool_list(tools)]
+
+
+def _has_system_prompt(messages):
+    return any(m.get("role") in _SYSTEM_PROMPT_ROLES for m in messages)
+
 
 XML_TAGS_REGEX = re.compile(
     r"<(" + "|".join(ROLES) + r")\s*(?:[^>]*)>\s*([\s\S]*?)\s*</\1>",
@@ -31,22 +67,26 @@ def default_prompt_template():
         (str): The default prompt template.
     """
     return """
-# Instructions
+<instructions>
 {{ instructions }}
+</instructions>
 {% if inputs_schema %}
-# Input Schema
+<input_schema>
 {{ inputs_schema }}
+</input_schema>
 {% endif %}{% if outputs_schema %}
-# Output schema
+<output_schema>
 {{ outputs_schema }}
+</output_schema>
 {% endif %}{% if examples %}
-# Examples
+<examples>
 {% for example in examples %}
-## Input:
+<example>
 {{ example[0] }}
-## Output:
 {{ example[1] }}
+</example>
 {% endfor %}
+</examples>
 {% endif %}
 """.strip()
 
@@ -57,10 +97,70 @@ Your task is to answer with a JSON containing the following keys: {data_model_fi
 """.strip()
 
 
+def format_chat_messages(inputs, system_message):
+    """Format the inputs into chat messages behind a system message.
+
+    Chat inputs keep their own system (or developer) prompt when they have
+    one; otherwise the given `system_message` is put first, and data inputs
+    are rendered as the user message.
+
+    Args:
+        inputs (JsonDataModel): The inputs to format.
+        system_message (ChatMessage): The system message to put first.
+
+    Returns:
+        (ChatMessages): The formatted chat messages.
+    """
+    # Strict chat inputs: keep the caller's own system/developer prompt when
+    # they supply one; otherwise inject ours.
+    if is_strictly_chat_messages(inputs):
+        msgs = inputs.get("messages")
+        if _has_system_prompt(msgs):
+            return ChatMessages(messages=msgs)
+        return ChatMessages(messages=[system_message.get_json(), *msgs])
+    if is_strictly_chat_message(inputs):
+        msg = inputs.get_json()
+        if _has_system_prompt([msg]):
+            return ChatMessages(messages=[msg])
+        return ChatMessages(messages=[system_message.get_json(), msg])
+
+    if is_chat_messages(inputs):
+        data = inputs.get_json()
+        msgs = data.get("messages")
+        # Fields declared before `messages` are the inputs; fields after it
+        # are outputs (e.g. concatenated by an upstream generator), so only
+        # the leading fields are rendered as the input turn.
+        keys = list(data.keys())
+        inputs_fields = {k: data[k] for k in keys[: keys.index("messages")]}
+        messages = [system_message]
+        if inputs_fields:
+            messages.append(
+                ChatMessage(
+                    role="user",
+                    content=f"{inputs_fields}",
+                )
+            )
+        messages.extend(msgs)
+        return ChatMessages(messages=messages)
+    # NB: a strictly-chat-message input is already handled by the
+    # is_strictly_chat_message early-return above. Anything that only
+    # *contains* a chat message here also carries extra fields (a reward's
+    # `gold_`-prefixed reference, inputs concatenated by an upstream
+    # generator, ...). Splatting the whole dict into a single ChatMessage
+    # would trip its `extra="forbid"`, so it falls through to be rendered as
+    # input data below.
+    user_message = ChatMessage(
+        role="user",
+        content=f"{inputs.get_json()}",
+    )
+    return ChatMessages(messages=[system_message, user_message])
+
+
 @synalinks_export(["synalinks.modules.Generator", "synalinks.Generator"])
 class Generator(Module):
     """
-    Use a `LanguageModel` to generate a data model from an arbitrary input data model.
+    Use a `LanguageModel` (or a `DecisionModel`) to generate a data model from an
+    arbitrary input data model.
 
     Example:
 
@@ -107,6 +207,56 @@ class Generator(Module):
         asyncio.run(main())
     ```
 
+    Pass a `decision_model` to answer with a `DecisionModel` instead of the
+    language model: it is faster and cheaper, and its answers are calibrated,
+    but it does not generate. Every field of the data model must be a question
+    it can answer (a `bool`, a string enum, a score such as `synalinks.Rating`,
+    or a `score_schema` object, see `DecisionModel`), otherwise an
+    `UnsupportedSchemaError` is raised. The instructions and examples are sent
+    to it as the system message.
+
+    ```python
+    import synalinks
+    import asyncio
+    from typing import Literal
+
+    async def main():
+
+        class Ticket(synalinks.DataModel):
+            message: str = synalinks.Field(
+                description="The customer message",
+            )
+
+        class Triage(synalinks.DataModel):
+            is_billing: bool = synalinks.Field(
+                description="Is the ticket about billing?",
+            )
+            urgency: Literal["low", "medium", "high"] = synalinks.Field(
+                description="How urgent is the ticket?",
+            )
+
+        decision_model = synalinks.DecisionModel(
+            model="typesafe/jev-latest",
+        )
+
+        x0 = synalinks.Input(data_model=Ticket)
+        x1 = await synalinks.Generator(
+            data_model=Triage,
+            decision_model=decision_model,
+            instructions="Triage the support tickets of an online shop.",
+        )(x0)
+
+        program = synalinks.Program(
+            inputs=x0,
+            outputs=x1,
+            name="ticket_triage",
+            description="Triage the support tickets",
+        )
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+    ```
+
     Args:
         schema (dict): The target JSON schema.
             If not provided use the `data_model` to infer it.
@@ -114,6 +264,15 @@ class Generator(Module):
             model for structured output.
         language_model (LanguageModel): The language model to use.
         prompt_template (str): The jinja2 prompt template.
+        prompt_variables (dict): Optional. Extra static Jinja2 variables
+            rendered into the prompt template on every call, alongside the
+            built-ins (``instructions``, ``examples``, ``inputs_schema``,
+            ``outputs_schema``, which win on a name clash). Plain
+            configuration, not trainable state, so in-context optimization
+            never rewrites them; agents use this channel for AGENTS.md
+            conventions (``custom_instructions``), the Agent Skills listing
+            (``available_skills``) and RLM's sandbox functions
+            (``sandbox_functions``).
         examples (list): The default list of examples, the examples
             are a list of tuples containing input/output JSON pairs.
         instructions (str): The default instructions being a string containing
@@ -126,35 +285,73 @@ class Generator(Module):
             the prompt (Default to False).
         return_inputs (bool): Optional. Whether or not to concatenate the inputs to
             the outputs (Default to False).
-        temperature (float): Optional. The temperature for the LM call.
+        temperature (float): Optional. The sampling temperature for the LM call.
+            Default to None: when None it is NOT sent, so the model's own
+            generation defaults apply (e.g. a vLLM-served model uses its
+            `generation_config.json`). Set a float to override.
+        max_tokens (int): Optional. Cap on the number of tokens generated. Default
+            to None (not sent → the provider/model default). Set it to bound
+            runaway / looping generations.
+        top_p (float): Optional. Nucleus-sampling top-p. Default None (not sent →
+            model default).
+        top_k (int): Optional. Top-k sampling. Default None (not sent → model
+            default).
         reasoning_effort (string): Optional. The reasoning effort for the LM call
             between ['minimal', 'low', 'medium', 'high', 'disable', 'none', None].
             Default to None (no reasoning).
         streaming (str): Optional. If true stream the LM response, enabled only if
-            `schema` is `None` and only during inference (not during training).
+            `schema` is `None`. Honored in every phase (inference, reward,
+            optimizer) and in training: in a batched loop (predict / evaluate /
+            the optimizer forward pass) or during training the stream is drained
+            into a concrete prediction so it stays scorable while still recording
+            time-to-first / time-to-last token (the optimizer phase included, so
+            its TTFT is measured). Only an interactive single call (no active
+            op_scope and not training) hands the live stream back to the caller.
+        tools (list): Optional. Live `synalinks.modules.Tool` objects (or a
+            `{name: Tool}` mapping) the generator always exposes, merged with any
+            `tools` passed to `call`. Serialized as `tool_schemas` (their wire
+            form) in the config, the way `data_model` is stored as `schema`.
+        tool_schemas (list): Optional. Already-wire-formatted tool declaration
+            dicts (OpenAI `{"type": "function", ...}` shape) the generator always
+            exposes. Merged with any `tool_schemas` passed to `call`. Being plain
+            JSON, they serialize with the config (unlike per-call `tools`).
         name (str): Optional. The name of the module.
         description (str): Optional. The description of the module.
         trainable (bool): Whether the module's variables should be trainable.
+        decision_model (DecisionModel): Optional. A decision model to answer
+            with instead of the language model. Every field of the schema must
+            be a question it can answer (see `DecisionModel.check_schema()`).
+            Without `decision_model` nor `language_model`, the default decision
+            model (see `synalinks.set_default_decision_model`) is used when it
+            can answer the schema, else the default language model.
     """
 
     def __init__(
         self,
+        *,
         schema=None,
         data_model=None,
         language_model=None,
         prompt_template=None,
+        prompt_variables=None,
         examples=None,
         instructions=None,
         seed_instructions=None,
         use_inputs_schema=False,
         use_outputs_schema=False,
         return_inputs=False,
-        temperature=0.0,
+        temperature=None,
+        max_tokens=None,
+        top_p=None,
+        top_k=None,
         reasoning_effort=None,
         streaming=False,
+        tools=None,
+        tool_schemas=None,
         name=None,
         description=None,
         trainable=True,
+        decision_model=None,
     ):
         super().__init__(
             name=name,
@@ -164,12 +361,21 @@ class Generator(Module):
         if not schema and data_model:
             schema = data_model.get_schema()
         self.schema = schema
-        if not language_model:
-            raise ValueError("You should provide `language_model` parameter.")
-        self.language_model = language_model
+        self.language_model = _get_lm(language_model)
+        self.decision_model = resolve_decision_model(decision_model, language_model)
+        if self.decision_model is not None:
+            try:
+                self.decision_model.check_schema(self.schema)
+            except UnsupportedSchemaError:
+                if decision_model is not None:
+                    raise
+                # The default decision model cannot answer this schema (it
+                # needs generation): use the language model.
+                self.decision_model = None
         if not prompt_template:
             prompt_template = default_prompt_template()
         self.prompt_template = prompt_template
+        self.prompt_variables = dict(prompt_variables or {})
         if not examples:
             examples = []
         self.examples = examples
@@ -179,7 +385,10 @@ class Generator(Module):
         self.instructions = instructions
         self.return_inputs = return_inputs
         self.temperature = temperature
-        efforts = ["minimal", "low", "medium", "high", "disable", "none", None]
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.top_k = top_k
+        efforts = ["minimal", "low", "medium", "high", "xhigh", "disable", "none", None]
         if reasoning_effort not in efforts:
             raise ValueError(
                 f"The reasoning effort parameter should be one of: {efforts}"
@@ -190,6 +399,14 @@ class Generator(Module):
         if schema and streaming:
             streaming = False
         self.streaming = streaming
+        # Live `Tool` objects the generator always exposes; merged with any
+        # passed per-call. They are not JSON, so `get_config` serializes them as
+        # wire-format `tool_schemas` (the way `data_model` is stored as `schema`).
+        self.tools = _as_tool_list(tools)
+        # Already wire-format (OpenAI `{"type": "function", ...}`) tool
+        # declarations the generator always exposes. Plain JSON dicts, so they
+        # serialize as-is and are merged with any per-call `tool_schemas`.
+        self.tool_schemas = tool_schemas
 
         predictions = [
             Prediction(
@@ -221,25 +438,61 @@ class Generator(Module):
             name="state_" + self.name,
         )
 
-    async def call(self, inputs, training=False):
+    async def call(self, inputs, tools=None, tool_schemas=None, training=False):
         if not inputs:
             return None
+        # Merge the always-on, constructor-level tools/schemas with any passed
+        # per-call.
+        tools = self.tools + _as_tool_list(tools) or None
+        tool_schemas = list(self.tool_schemas or []) + list(tool_schemas or []) or None
         msgs = self.format_messages(inputs)
-        if self.streaming and not training:
-            streaming = True
-        else:
-            streaming = False
-        result = await ops.predict(
+        # Streaming is honored in every phase (inference, reward, optimizer) and
+        # in training. When it is drained below (any batched loop or training
+        # pass) the prediction stays concrete and scorable while still recording
+        # TTFT / TTLT, so there is no reason to disable it -- including during
+        # training and single-sample (batch=1) runs. Keeping it on in the
+        # optimizer phase is deliberate: its time-to-first-token must be measured
+        # too.
+        streaming = bool(self.streaming)
+        # Only forward sampling params that were explicitly set, so an unset
+        # (None) value falls through to the model's own generation defaults
+        # (e.g. a vLLM-served model applies its generation_config.json) instead
+        # of being sent as `null`. litellm.drop_params drops *unsupported* keys,
+        # not None-valued ones, so the filtering must happen here.
+        sampling = {}
+        if self.temperature is not None:
+            sampling["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            sampling["max_tokens"] = self.max_tokens
+        if self.top_p is not None:
+            sampling["top_p"] = self.top_p
+        if self.top_k is not None:
+            sampling["top_k"] = self.top_k
+        model = self.decision_model or self.language_model
+        value = await model(
             msgs,
             schema=self.schema,
-            language_model=self.language_model,
+            tools=tools,
+            tool_schemas=tool_schemas,
             streaming=streaming,
-            name="prediction_" + self.name,
-            temperature=self.temperature,
             reasoning_effort=self.reasoning_effort,
+            **sampling,
         )
-        if streaming:
-            return result
+        if isinstance(value, StreamingIterator):
+            # A purely interactive call (no op_scope, not training) hands the
+            # lazy stream to the caller to consume. Inside a batched loop
+            # (predict / evaluate run under op_scope) or during training the
+            # prediction must be concrete -- to be scored and recorded into the
+            # optimizer's prediction state -- so drain the stream into a
+            # ChatMessage; time-to-first / time-to-last token are still recorded
+            # as it is consumed.
+            if current_op_scope() is None and not training:
+                return value
+            value = await value.aconsume(name=f"{self.language_model.name}_response")
+        if not value:
+            result = None
+        else:
+            result = value.clone(name="prediction_" + self.name)
         if result:
             if training:
                 predictions = self.state.get("current_predictions")
@@ -260,7 +513,9 @@ class Generator(Module):
                 return result
         return None
 
-    async def compute_output_spec(self, inputs, training=False):
+    async def compute_output_spec(
+        self, inputs, tools=None, tool_schemas=None, training=False
+    ):
         if self.schema:
             if self.return_inputs:
                 return await ops.concat(
@@ -293,27 +548,32 @@ class Generator(Module):
                 )
 
     def format_messages(self, inputs=None):
+        return format_chat_messages(inputs, self._render_system_message(inputs))
+
+    def _render_system_message(self, inputs):
         template = jinja2.Template(self.prompt_template)
         rendered_prompt = template.render(
-            inputs_schema=inputs.get_schema() if self.use_inputs_schema else None,
-            outputs_schema=self.schema if self.use_outputs_schema else None,
-            examples=[
-                (pred.get("inputs"), pred.get("outputs"))
-                for pred in self.state.get("examples")
-            ],
-            instructions=self.state.get("instructions"),
+            **{
+                # Built-in variables win over a same-named prompt variable.
+                **self.prompt_variables,
+                "inputs_schema": (
+                    inputs.get_schema() if self.use_inputs_schema else None
+                ),
+                "outputs_schema": self.schema if self.use_outputs_schema else None,
+                "examples": [
+                    (pred.get("inputs"), pred.get("outputs"))
+                    for pred in self.state.get("examples")
+                ],
+                "instructions": self.state.get("instructions"),
+            }
         )
-        system_message = ChatMessage(role="system", content=rendered_prompt)
-        user_message = ChatMessage(
-            role="user", content=f"## Input:\n{inputs.get_json()}\n##Output:\n"
-        )
-        msgs = ChatMessages(messages=[system_message, user_message])
-        return msgs
+        return ChatMessage(role="system", content=rendered_prompt)
 
     def get_config(self):
         config = {
             "schema": self.schema,
             "prompt_template": self.prompt_template,
+            "prompt_variables": self.prompt_variables,
             "examples": self.examples,
             "instructions": self.instructions,
             "seed_instructions": self.seed_instructions,
@@ -321,7 +581,17 @@ class Generator(Module):
             "use_outputs_schema": self.use_outputs_schema,
             "return_inputs": self.return_inputs,
             "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
             "reasoning_effort": self.reasoning_effort,
+            "streaming": self.streaming,
+            # Live `tools` are converted to their wire form and stored alongside
+            # `tool_schemas` (the way `data_model` is stored as `schema`).
+            "tool_schemas": (
+                list(self.tool_schemas or []) + _tools_to_schemas(self.tools)
+            )
+            or None,
             "name": self.name,
             "description": self.description,
             "trainable": self.trainable,
@@ -331,6 +601,10 @@ class Generator(Module):
                 self.language_model,
             )
         }
+        if self.decision_model is not None:
+            language_model_config["decision_model"] = (
+                serialization_lib.serialize_synalinks_object(self.decision_model)
+            )
         return {
             **config,
             **language_model_config,
@@ -341,6 +615,10 @@ class Generator(Module):
         language_model = serialization_lib.deserialize_synalinks_object(
             config.pop("language_model"),
         )
+        if "decision_model" in config:
+            config["decision_model"] = serialization_lib.deserialize_synalinks_object(
+                config.pop("decision_model"),
+            )
         return cls(
             language_model=language_model,
             **config,

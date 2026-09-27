@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import inspect
 import logging
@@ -13,6 +13,8 @@ from tenacity import wait_exponential
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend import JsonDataModel
 from synalinks.src.backend import SymbolicDataModel
+from synalinks.src.backend.pydantic.media import Audio
+from synalinks.src.backend.pydantic.media import Image
 from synalinks.src.modules.module import Module
 from synalinks.src.saving import serialization_lib
 
@@ -125,7 +127,9 @@ class Tool(Module):
         Args:
             expression (str): The mathematical expression to calculate.
         \"\"\"
-        result = eval(expression)
+        if not all(char in "0123456789+-*/(). " for char in expression):
+            return {"result": None, "log": "Error: invalid characters"}
+        result = eval(expression, {"__builtins__": None}, {})
         return {"result": result}
 
     tool = synalinks.Tool(calculate)
@@ -133,10 +137,14 @@ class Tool(Module):
     ```
 
     Important:
-        **No Optional Parameters**: All function parameters must be required.
-        Optional parameters with default values are not supported because
-        LLM providers require all parameters to be required
-        in their structured output JSON schemas.
+        **Optional Parameters**: Parameters with default values are
+        supported. A defaulted parameter is left out of the schema's
+        `required` list and its default is emitted in the schema, so the
+        language model may omit it and the function's default applies.
+        (`Optional[T]` is treated as `T`; the `None` member is dropped.)
+        The "every property must be required" rule that some providers
+        enforce only applies to *strict structured output*, which is a
+        separate code path from tool calling.
 
         **Complete Docstring Required**: The wrapped function must have a
         complete docstring with an `Args:` section that documents every
@@ -158,6 +166,22 @@ class Tool(Module):
             return {"results": [...]}
         ```
 
+        **Images and audio**: A tool can show images to the language model,
+        or play it audio, by returning `synalinks.Image` / `synalinks.Audio`
+        values in its dict (alone, or in a list). The agents attach them to
+        the tool result so a model that takes them gets them, and they stay
+        in the returned trajectory for the user:
+
+        ```python
+        async def render(path: str):
+            \"\"\"Render a chart.
+
+            Args:
+                path (str): The chart file.
+            \"\"\"
+            return {"path": path, "image": synalinks.Image(path=path)}
+        ```
+
     Args:
         func (Callable): The async function to wrap as a tool.
         name (str): Optional. The name of the module. Defaults to the function name.
@@ -170,6 +194,7 @@ class Tool(Module):
     def __init__(
         self,
         func: typing.Callable,
+        *,
         name=None,
         description=None,
         trainable=False,
@@ -326,6 +351,16 @@ class Tool(Module):
         if result is None:
             return None
         if isinstance(result, dict):
+            # Returned media become their content parts, to stay JSON.
+            result = dict(result)
+            for key, value in result.items():
+                if isinstance(value, (Image, Audio)):
+                    result[key] = value.to_content_part()
+                elif isinstance(value, list):
+                    result[key] = [
+                        v.to_content_part() if isinstance(v, (Image, Audio)) else v
+                        for v in value
+                    ]
             return JsonDataModel(
                 json=result,
                 schema=self._build_output_schema(),

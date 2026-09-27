@@ -1,6 +1,6 @@
 # Modified from: keras/src/saving/object_registration.py
 # Original authors: François Chollet et al. (Keras Team)
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import inspect
 
@@ -97,6 +97,7 @@ def get_custom_objects():
     [
         "synalinks.saving.register_synalinks_serializable",
         "synalinks.utils.register_synalinks_serializable",
+        "synalinks.register_synalinks_serializable",
     ]
 )
 def register_synalinks_serializable(package="Custom", name=None):

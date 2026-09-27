@@ -1,6 +1,6 @@
 # Modified from: keras/src/metrics/reduction_metrics.py
 # Original authors: François Chollet et al. (Keras Team)
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from synalinks.src import ops
 from synalinks.src import rewards
@@ -33,10 +33,25 @@ class Sum(Metric):
     This metric creates one variable, `total`.
     This is ultimately returned as the sum value.
 
+
+    Compilation example:
+
+    ```python
+    program.compile(
+        metrics=[
+            synalinks.metrics.Sum(),
+        ],
+    )
+    ```
+
     Args:
         name (str): (Optional) string name of the metric instance.
         in_mask (list): (Optional) list of keys to keep to compute the metric.
         out_mask (list): (Optional) list of keys to remove to compute the metric.
+        in_mask_pattern (str): (Optional) Regex pattern; fields whose names match
+            are kept (combined with ``in_mask`` via OR).
+        out_mask_pattern (str): (Optional) Regex pattern; fields whose names match
+            are dropped (combined with ``out_mask`` via OR).
 
     Example:
 
@@ -48,8 +63,21 @@ class Sum(Metric):
     ```
     """
 
-    def __init__(self, name="sum", in_mask=None, out_mask=None):
-        super().__init__(name=name, in_mask=in_mask, out_mask=out_mask)
+    def __init__(
+        self,
+        name="sum",
+        in_mask=None,
+        out_mask=None,
+        in_mask_pattern=None,
+        out_mask_pattern=None,
+    ):
+        super().__init__(
+            name=name,
+            in_mask=in_mask,
+            out_mask=out_mask,
+            in_mask_pattern=in_mask_pattern,
+            out_mask_pattern=out_mask_pattern,
+        )
         self.total = self.add_variable(
             data_model=Total,
             name="total",
@@ -81,10 +109,25 @@ class Mean(Metric):
     This metric creates two variables, `total` and `count`.
     The mean value returned is simply `total` divided by `count`.
 
+
+    Compilation example:
+
+    ```python
+    program.compile(
+        metrics=[
+            synalinks.metrics.Mean(),
+        ],
+    )
+    ```
+
     Args:
         name (str): (Optional) string name of the metric instance.
         in_mask (list): (Optional) list of keys to keep to compute the metric.
         out_mask (list): (Optional) list of keys to remove to compute the metric.
+        in_mask_pattern (str): (Optional) Regex pattern; fields whose names match
+            are kept (combined with ``in_mask`` via OR).
+        out_mask_pattern (str): (Optional) Regex pattern; fields whose names match
+            are dropped (combined with ``out_mask`` via OR).
 
     Example:
 
@@ -96,8 +139,21 @@ class Mean(Metric):
     ```
     """
 
-    def __init__(self, name="mean", in_mask=None, out_mask=None):
-        super().__init__(name=name, in_mask=in_mask, out_mask=out_mask)
+    def __init__(
+        self,
+        name="mean",
+        in_mask=None,
+        out_mask=None,
+        in_mask_pattern=None,
+        out_mask_pattern=None,
+    ):
+        super().__init__(
+            name=name,
+            in_mask=in_mask,
+            out_mask=out_mask,
+            in_mask_pattern=in_mask_pattern,
+            out_mask_pattern=out_mask_pattern,
+        )
         self.total_with_count = self.add_variable(
             data_model=TotalWithCount, name="total_with_count"
         )
@@ -134,20 +190,46 @@ class MeanMetricWrapper(Mean):
     per-sample reward array. `MeanMetricWrapper.result()` will return
     the average metric value across all samples seen so far.
 
+
+    Example:
+
+    ```python
+    program.compile(
+        metrics=[
+            synalinks.metrics.MeanMetricWrapper(),
+        ],
+    )
+    ```
+
     Args:
         fn (callable): The metric function to wrap, with signature
             `fn(y_true, y_pred, **kwargs)`.
         name (str): (Optional) string name of the metric instance.
         in_mask (list): (Optional) list of keys to keep to compute the metric.
         out_mask (list): (Optional) list of keys to remove to compute the metric.
+        in_mask_pattern (str): (Optional) Regex pattern; fields whose names match
+            are kept (combined with ``in_mask`` via OR).
+        out_mask_pattern (str): (Optional) Regex pattern; fields whose names match
+            are dropped (combined with ``out_mask`` via OR).
         **kwargs (keyword arguments): Keyword arguments to pass on to `fn`.
     """
 
-    def __init__(self, fn, name=None, in_mask=None, out_mask=None, **kwargs):
+    def __init__(
+        self,
+        fn,
+        name=None,
+        in_mask=None,
+        out_mask=None,
+        in_mask_pattern=None,
+        out_mask_pattern=None,
+        **kwargs,
+    ):
         super().__init__(
             name=name,
             in_mask=in_mask,
             out_mask=out_mask,
+            in_mask_pattern=in_mask_pattern,
+            out_mask_pattern=out_mask_pattern,
         )
         self._fn = fn
         self._fn_kwargs = kwargs
@@ -159,17 +241,45 @@ class MeanMetricWrapper(Mean):
             or hasattr(self._fn, "__class__")
             and self._fn.__class__ in rewards.ALL_OBJECTS
         ):
-            self._direction = "up"
+            self.direction = "up"
 
     async def update_state(self, y_true, y_pred):
         y_pred = tree.map_structure(lambda x: ops.convert_to_json_data_model(x), y_pred)
         y_true = tree.map_structure(lambda x: ops.convert_to_json_data_model(x), y_true)
-        if self.in_mask:
-            y_pred = tree.map_structure(lambda x: x.in_mask(mask=self.in_mask), y_pred)
-            y_true = tree.map_structure(lambda x: x.in_mask(mask=self.in_mask), y_true)
-        if self.out_mask:
-            y_pred = tree.map_structure(lambda x: x.out_mask(mask=self.out_mask), y_pred)
-            y_true = tree.map_structure(lambda x: x.out_mask(mask=self.out_mask), y_true)
+        if self.in_mask or self.in_mask_pattern:
+            y_pred = tree.map_structure(
+                lambda x: (
+                    x.in_mask(mask=self.in_mask, pattern=self.in_mask_pattern)
+                    if x is not None
+                    else x
+                ),
+                y_pred,
+            )
+            y_true = tree.map_structure(
+                lambda x: (
+                    x.in_mask(mask=self.in_mask, pattern=self.in_mask_pattern)
+                    if x is not None
+                    else x
+                ),
+                y_true,
+            )
+        if self.out_mask or self.out_mask_pattern:
+            y_pred = tree.map_structure(
+                lambda x: (
+                    x.out_mask(mask=self.out_mask, pattern=self.out_mask_pattern)
+                    if x is not None
+                    else x
+                ),
+                y_pred,
+            )
+            y_true = tree.map_structure(
+                lambda x: (
+                    x.out_mask(mask=self.out_mask, pattern=self.out_mask_pattern)
+                    if x is not None
+                    else x
+                ),
+                y_true,
+            )
         values = await self._fn(y_true, y_pred, **self._fn_kwargs)
         return await super().update_state(values)
 

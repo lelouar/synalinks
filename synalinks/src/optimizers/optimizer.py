@@ -1,7 +1,8 @@
 # Modified from: keras/src/ops/optimizer.py
 # Original authors: François Chollet et al. (Keras Team)
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
+import math
 import random
 import warnings
 
@@ -11,10 +12,12 @@ import numpy as np
 from synalinks.src import backend
 from synalinks.src.backend import DataModel
 from synalinks.src.backend import Trainable
+from synalinks.src.backend.common import numpy as np_backend
 from synalinks.src.backend.common.json_utils import out_mask_json
 from synalinks.src.initializers import Empty
 from synalinks.src.metrics import Metric
 from synalinks.src.modules import Module
+from synalinks.src.rewards.reward import reduce_rewards
 from synalinks.src.saving.synalinks_saveable import SynalinksSaveable
 from synalinks.src.utils import tracking
 from synalinks.src.utils.naming import auto_name
@@ -23,6 +26,12 @@ from synalinks.src.utils.naming import auto_name
 class Iterations(DataModel):
     iterations: int = 0
     epochs: int = 0
+
+
+# Keys a stored candidate carries on top of its trainable content. They are
+# masked out before a candidate is compared to another one or written back
+# into a variable.
+CANDIDATE_METADATA_KEYS = ["reward", "reward_count"]
 
 
 class Optimizer(SynalinksSaveable):
@@ -37,6 +46,11 @@ class Optimizer(SynalinksSaveable):
     Args:
         population_size (int): The maximum number of best candidates to keep
             during the optimization process.
+        sampling_temperature (float): The temperature for softmax sampling of
+            which trainable variable to update at each step in
+            `select_variable_name_to_update`. Lower values concentrate updates
+            on under-visited / low-reward variables, higher values make the
+            choice more uniform (Default 0.3).
         name (str): Optional. The name of the optimizer.
         description (str): Optional. The description of the optimizer.
     """
@@ -44,6 +58,8 @@ class Optimizer(SynalinksSaveable):
     def __init__(
         self,
         population_size=10,
+        sampling_temperature=0.3,
+        reward_uncertainty=0.25,
         name=None,
         description=None,
         **kwargs,
@@ -55,6 +71,13 @@ class Optimizer(SynalinksSaveable):
         Args:
             population_size (int): The maximum number of best candidates to keep
                 during the optimization process.
+            sampling_temperature (float): The temperature for softmax sampling
+                of which trainable variable to update at each step.
+            reward_uncertainty (float): Standard deviation of the reward of a
+                single sample, used to rank candidates by a lower confidence
+                bound `reward - reward_uncertainty / sqrt(reward_count)` so a
+                candidate scored on a few samples does not outrank one scored
+                on many on a near-tie. 0 disables it.
             name (str): Optional name for the optimizer instance
             description (str): Optional description for the optimizer
             **kwargs (keyword params): Additional arguments (will raise error if provided)
@@ -68,6 +91,8 @@ class Optimizer(SynalinksSaveable):
             raise ValueError(f"Argument(s) not recognized: {kwargs}")
 
         self.population_size = population_size
+        self.sampling_temperature = sampling_temperature
+        self.reward_uncertainty = reward_uncertainty
 
         if name is None:
             name = auto_name(self.__class__.__name__)
@@ -246,6 +271,68 @@ class Optimizer(SynalinksSaveable):
                 "Go add it!"
             )
 
+    def candidate_score(self, candidate):
+        """Lower confidence bound of a candidate's reward.
+
+        `reward - reward_uncertainty / sqrt(reward_count)`: the stored reward is
+        a mean over `reward_count` samples, so a candidate measured on few
+        samples is discounted more than one measured on many.
+
+        Args:
+            candidate (dict): A stored candidate with `reward` and `reward_count`.
+
+        Returns:
+            (float): The score used to rank candidates.
+        """
+        reward = float(candidate.get("reward", 0.0) or 0.0)
+        count = max(1, int(candidate.get("reward_count", 1) or 1))
+        return reward - self.reward_uncertainty / math.sqrt(count)
+
+    def find_candidate(self, trainable_variable, content=None):
+        """The stored candidate whose content matches `content` (default: the
+        variable's current content), or None when it is not in the population."""
+        mask = list(Trainable.keys()) + CANDIDATE_METADATA_KEYS
+        if content is None:
+            content = out_mask_json(trainable_variable.get_json(), mask=mask)
+        candidates = trainable_variable.get("candidates")
+        best_candidates = trainable_variable.get("best_candidates")
+        for candidate in candidates + best_candidates:
+            if out_mask_json(candidate, mask=mask) == content:
+                return candidate
+        return None
+
+    @staticmethod
+    def fold_reward(candidate, reward, weight=1):
+        """Merge a measurement (mean over `weight` samples) into a candidate's
+        sample-weighted running mean, in place."""
+        count = int(candidate.get("reward_count", 1) or 1)
+        weight = max(1, int(weight or 1))
+        candidate["reward"] = (
+            float(candidate.get("reward", 0.0) or 0.0) * count + float(reward) * weight
+        ) / (count + weight)
+        candidate["reward_count"] = count + weight
+
+    def assign_validation_reward(self, trainable_variables, logs=None, val_size=None):
+        """Fold the epoch-end validation reward into the candidate it measured.
+
+        The trainer validates the program at the end of the epoch with the
+        candidate that `on_batch_end` promoted into each variable. That score
+        is exact for `val_size` samples, so it is merged into the candidate's
+        running mean with that weight, replacing the noisy minibatch estimate
+        the candidate was promoted on.
+
+        Args:
+            trainable_variables (list): The list of trainable variables.
+            logs (dict): The epoch logs, read for `val_reward`.
+            val_size (int): Number of validation samples behind `val_reward`.
+        """
+        if not logs or logs.get("val_reward") is None:
+            return
+        for trainable_variable in trainable_variables:
+            candidate = self.find_candidate(trainable_variable)
+            if candidate is not None:
+                self.fold_reward(candidate, logs["val_reward"], weight=val_size or 1)
+
     async def select_variable_name_to_update(self, trainable_variables):
         rewards = []
         for trainable_variable in trainable_variables:
@@ -256,11 +343,11 @@ class Optimizer(SynalinksSaveable):
             else:
                 variable_reward = cumulative_reward / nb_visit
             rewards.append(variable_reward)
-        rewards = np.array(rewards)
+        rewards = np_backend.convert_to_tensor(rewards)
         inverted_rewards = -rewards
         scaled_rewards = inverted_rewards / self.sampling_temperature
-        exp_rewards = np.exp(scaled_rewards - np.max(scaled_rewards))
-        probabilities = exp_rewards / np.sum(exp_rewards)
+        exp_rewards = np_backend.exp(scaled_rewards - np_backend.max(scaled_rewards))
+        probabilities = exp_rewards / np_backend.sum(exp_rewards)
         selected_variable = np.random.choice(
             trainable_variables,
             size=1,
@@ -332,7 +419,7 @@ class Optimizer(SynalinksSaveable):
             best_candidate = sorted_candidates[0]
             best_candidate = out_mask_json(
                 best_candidate,
-                mask=["reward"],
+                mask=CANDIDATE_METADATA_KEYS,
             )
             variable.update(
                 {
@@ -363,13 +450,20 @@ class Optimizer(SynalinksSaveable):
         self,
         epoch,
         trainable_variables,
+        logs=None,
+        val_size=None,
     ):
         """Called at the end of an epoch
 
         Args:
             epoch (int): The epoch number
             trainable_variables (list): The list of trainable variables
+            logs (dict): Optional. The epoch logs; `val_reward` is folded into
+                the promoted candidate (see `assign_validation_reward`).
+            val_size (int): Optional. Number of validation samples behind
+                `val_reward`.
         """
+        self.assign_validation_reward(trainable_variables, logs=logs, val_size=val_size)
         mask = list(Trainable.keys())
         mask.remove("examples")
 
@@ -379,7 +473,7 @@ class Optimizer(SynalinksSaveable):
             all_candidates = candidates + best_candidates
             sorted_candidates = sorted(
                 all_candidates,
-                key=lambda x: x.get("reward"),
+                key=self.candidate_score,
                 reverse=True,
             )
             selected_candidates = sorted_candidates[: self.population_size]
@@ -391,7 +485,7 @@ class Optimizer(SynalinksSaveable):
             best_candidate = selected_candidates[0]
             best_candidate = out_mask_json(
                 best_candidate,
-                mask=["reward"],
+                mask=CANDIDATE_METADATA_KEYS,
             )
             trainable_variable.update(
                 {
@@ -433,7 +527,7 @@ class Optimizer(SynalinksSaveable):
                     best_candidate = random.choice(best_candidates)
                     best_candidate = out_mask_json(
                         best_candidate,
-                        mask=["reward"],
+                        mask=CANDIDATE_METADATA_KEYS,
                     )
                     trainable_variable.update(
                         {
@@ -476,13 +570,13 @@ class Optimizer(SynalinksSaveable):
             if len(all_candidates) > 0:
                 sorted_candidates = sorted(
                     all_candidates,
-                    key=lambda x: x.get("reward"),
+                    key=self.candidate_score,
                     reverse=True,
                 )
                 best_candidate = sorted_candidates[0]
                 best_candidate = out_mask_json(
                     best_candidate,
-                    mask=["reward"],
+                    mask=CANDIDATE_METADATA_KEYS,
                 )
                 trainable_variable.update(
                     {
@@ -529,6 +623,42 @@ class Optimizer(SynalinksSaveable):
             trainable_variables,
             rewards=rewards,
         )
+        train_rewards = rewards
+        self.observe_training_batch(x=x, y=y, y_pred=y_pred, rewards=rewards)
+        compile_reward = getattr(self.program, "_compile_reward", None)
+        reduction = compile_reward.reduction if compile_reward is not None else "mean"
+        val_weight = len(val_x) if val_x is not None else 1
+        mask = list(Trainable.keys()) + CANDIDATE_METADATA_KEYS
+
+        # Score the parent (the candidate `on_batch_begin` put in the variables)
+        # on the validation minibatch, so its running mean keeps accumulating
+        # measurements and the child below is compared on the same samples.
+        # Only candidates already in the population are refreshed: a seed that
+        # was never proposed is not added, so the population only grows through
+        # proposals.
+        parents = [
+            out_mask_json(trainable_variable.get_json(), mask=mask)
+            for trainable_variable in trainable_variables
+        ]
+        known_parents = [
+            self.find_candidate(trainable_variable, content=content)
+            for trainable_variable, content in zip(trainable_variables, parents)
+        ]
+        val_y_pred = None
+        if any(candidate is not None for candidate in known_parents):
+            val_y_pred = await self.program.predict_on_batch(
+                x=val_x,
+                training=False,
+            )
+            rewards = await self.program.compute_reward(
+                x=val_x,
+                y=val_y,
+                y_pred=val_y_pred,
+            )
+            scalar_reward = reduce_rewards(rewards, reduction)
+            for candidate in known_parents:
+                if candidate is not None:
+                    self.fold_reward(candidate, scalar_reward, weight=val_weight)
 
         await self.propose_new_candidates(
             step,
@@ -536,19 +666,35 @@ class Optimizer(SynalinksSaveable):
             x=x,
             y=y,
             y_pred=y_pred,
+            rewards=train_rewards,
             training=True,
         )
 
-        y_pred = await self.program.predict_on_batch(
-            x=val_x,
-            training=False,
-        )
-
-        rewards = await self.program.compute_reward(
-            x=val_x,
-            y=val_y,
-            y_pred=y_pred,
-        )
+        # Score the child on the same minibatch, unless the proposal left the
+        # variables unchanged (a failed or duplicate proposal): the parent's
+        # measurement then stands and is not counted twice.
+        children = [
+            out_mask_json(trainable_variable.get_json(), mask=mask)
+            for trainable_variable in trainable_variables
+        ]
+        if children != parents or val_y_pred is None:
+            val_y_pred = await self.program.predict_on_batch(
+                x=val_x,
+                training=False,
+            )
+            rewards = await self.program.compute_reward(
+                x=val_x,
+                y=val_y,
+                y_pred=val_y_pred,
+            )
+            scalar_reward = reduce_rewards(rewards, reduction)
+            for trainable_variable in trainable_variables:
+                await self.maybe_add_candidate(
+                    step,
+                    trainable_variable,
+                    reward=scalar_reward,
+                    weight=val_weight,
+                )
 
         if self.trainable_variables:
             await self.assign_reward_to_predictions(
@@ -556,17 +702,16 @@ class Optimizer(SynalinksSaveable):
                 rewards=rewards,
             )
 
-        mean_reward = float(sum(rewards) / len(rewards))
-        for trainable_variable in trainable_variables:
-            await self.maybe_add_candidate(
-                step,
-                trainable_variable,
-                reward=mean_reward,
-            )
-
-        await self.reward_tracker.update_state(mean_reward)
-        metrics = await self.program.compute_metrics(val_x, val_y, y_pred)
+        await self.reward_tracker.update_state(scalar_reward)
+        metrics = await self.program.compute_metrics(val_x, val_y, val_y_pred)
         return metrics
+
+    def observe_training_batch(self, x=None, y=None, y_pred=None, rewards=None):
+        """Hook called with every judged training batch and its per-sample
+        rewards, before candidates are proposed. The base implementation does
+        nothing; optimizers may keep per-sample statistics (see OMEGA's
+        hard-example memory)."""
+        return None
 
     async def propose_new_candidates(
         self,
@@ -575,6 +720,7 @@ class Optimizer(SynalinksSaveable):
         x=None,
         y=None,
         y_pred=None,
+        rewards=None,
         training=False,
     ):
         raise NotImplementedError(
@@ -600,23 +746,25 @@ class Optimizer(SynalinksSaveable):
         if not rewards:
             rewards = [0.0]
         for trainable_variable in trainable_variables:
-            current_predictions = trainable_variable.get(
-                "current_predictions"
-            )
+            current_predictions = trainable_variable.get("current_predictions")
             predictions = trainable_variable.get("predictions")
-            unassigned = [
-                p for p in current_predictions if p["reward"] is None
-            ]
+            unassigned = [p for p in current_predictions if p["reward"] is None]
             for p, r in zip(unassigned, rewards):
                 p["reward"] = r
-                nb_visit = trainable_variable.get("nb_visit")
-                cumulative_reward = trainable_variable.get(
-                    "cumulative_reward"
-                )
+            # `nb_visit` / `cumulative_reward` are the per-batch struggle signal
+            # read by `select_variable_name_to_update`: they reflect ONLY this
+            # batch's predictions for this variable (reset, not accumulated), so
+            # the next selection picks whichever module struggled in THIS batch;
+            # a different variable can win each batch. Skip the update when
+            # this pass produced no predictions for the variable (e.g. the
+            # validation assign pass, where `current_predictions` is empty) so
+            # the train-batch signal isn't wiped out.
+            scored = [p["reward"] for p in current_predictions if p["reward"] is not None]
+            if scored:
                 trainable_variable.update(
                     {
-                        "nb_visit": nb_visit + 1,
-                        "cumulative_reward": cumulative_reward + r,
+                        "nb_visit": len(scored),
+                        "cumulative_reward": float(sum(scored)),
                     }
                 )
             trainable_variable.update(
@@ -673,20 +821,23 @@ class Optimizer(SynalinksSaveable):
         new_candidate=None,
         examples=None,
         reward=None,
+        weight=1,
     ):
-        """Maybe add new candidate to candidates.
+        """Add a candidate, or fold a new measurement into a known one.
 
         Args:
             step (int): The training step.
             trainable_variable (Variable): The variable to add candidate to.
             new_candidate (dict): New candidate configuration (optional).
             examples (list): New examples for few-shot learning (optional).
-            reward (float): The candidate reward.
+            reward (float): The measured reward (a mean over `weight` samples).
+            weight (int): Number of samples behind `reward`; the candidate's
+                stored reward is the sample-weighted running mean and
+                `reward_count` the total number of samples.
         """
         if not reward:
             reward = 0.0
-        mask = list(Trainable.keys())
-        mask.append("reward")
+        mask = list(Trainable.keys()) + CANDIDATE_METADATA_KEYS
         if new_candidate:
             new_candidate = out_mask_json(
                 new_candidate.get_json(),
@@ -703,23 +854,26 @@ class Optimizer(SynalinksSaveable):
         candidates = trainable_variable.get("candidates")
         best_candidates = trainable_variable.get("best_candidates")
         all_candidates = best_candidates + candidates
-        is_present = False
         for candidate in all_candidates:
             if out_mask_json(candidate, mask=mask) == new_candidate:
-                is_present = True
-                break
-        if not is_present:
-            candidates.append(
-                {
-                    **new_candidate,
-                    "examples": examples,
-                    "reward": reward,
-                }
-            )
+                # Already known: each reward is a noisy minibatch estimate, so
+                # fold the new measurement into a running mean instead of
+                # keeping whichever draw came first.
+                self.fold_reward(candidate, reward, weight=weight)
+                return
+        candidates.append(
+            {
+                **new_candidate,
+                "examples": examples,
+                "reward": reward,
+                "reward_count": max(1, int(weight or 1)),
+            }
+        )
 
     def get_config(self):
         return {
             "population_size": self.population_size,
+            "reward_uncertainty": self.reward_uncertainty,
             "name": self.name,
             "description": self.description,
         }

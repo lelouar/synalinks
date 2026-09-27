@@ -1,11 +1,11 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from synalinks.src import testing
 from synalinks.src.backend import DataModel
 from synalinks.src.backend import Field
-from synalinks.src.language_models.language_model import LanguageModel
 from synalinks.src.modules.agents.function_calling_agent import FunctionCallingAgent
 from synalinks.src.modules.core.input_module import Input
+from synalinks.src.modules.language_models.language_model import LanguageModel
 from synalinks.src.modules.synthesis.sequential_plan_synthesis import (
     SequentialPlanSynthesis,
 )

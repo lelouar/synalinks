@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import collections
 import copy
@@ -9,8 +9,15 @@ from synalinks.src.utils.nlp_utils import is_plural
 from synalinks.src.utils.nlp_utils import to_plural_without_numerical_suffix
 from synalinks.src.utils.nlp_utils import to_singular_without_numerical_suffix
 
+# Try to import rust based utils (faster)
+# while defaulting to python based one
+try:
+    import synaops
+except ImportError:
+    synaops = None
 
-def prefix_json(json, prefix):
+
+def _py_prefix_json(json, prefix):
     """Add a prefix to the json object keys"""
     json = copy.deepcopy(json)
     prefixed_json = {}
@@ -19,7 +26,14 @@ def prefix_json(json, prefix):
     return prefixed_json
 
 
-def suffix_json(json, suffix):
+def prefix_json(json, prefix):
+    """Add a prefix to the json object keys"""
+    if synaops:
+        return synaops.prefix_json(json=json, prefix=prefix)
+    return _py_prefix_json(json=json, prefix=prefix)
+
+
+def _py_suffix_json(json, suffix):
     """Add a suffix to the json object keys"""
     json = copy.deepcopy(json)
     suffixed_json = {}
@@ -28,7 +42,14 @@ def suffix_json(json, suffix):
     return suffixed_json
 
 
-def concatenate_json(json1, json2):
+def suffix_json(json, suffix):
+    """Add a suffix to the json object keys"""
+    if synaops:
+        return synaops.suffix_json(json=json, suffix=suffix)
+    return _py_suffix_json(json=json, suffix=suffix)
+
+
+def _py_concatenate_json(json1, json2):
     """Concatenate two Json objects into a single schema.
 
     This function merges the properties of two Json object into a single object.
@@ -63,7 +84,31 @@ def concatenate_json(json1, json2):
     return result_json
 
 
-def factorize_json(json):
+def concatenate_json(json1, json2):
+    """Concatenate two Json objects into a single schema.
+
+    This function merges the properties of two Json object into a single object.
+    If there are conflicting property names, it appends a suffix to make them unique.
+
+    Args:
+        json1 (dict): The first Json object to be concatenated.
+        json2 (dict): The second Json object to be concatenated.
+
+    Returns:
+        (dict): A new Json object that combines the properties of the input objects.
+    """
+    if synaops:
+        return synaops.concatenate_json(
+            json1=json1,
+            json2=json2,
+        )
+    return _py_concatenate_json(
+        json1=json1,
+        json2=json2,
+    )
+
+
+def _py_factorize_json(json):
     """Factorize a Json object by grouping similar properties into lists.
 
     This function groups similar properties in a Json object into list properties.
@@ -111,37 +156,25 @@ def factorize_json(json):
     return result_json
 
 
-def decompose_json(json):
-    """Decompose a Json object by expanding list properties into individual ones.
+def factorize_json(json):
+    """Factorize a Json object by grouping similar properties into lists.
 
-    This is the inverse of factorize_json. It takes list properties and
-    expands them into individual properties with numerical suffixes.
-    For example `foos: ["a", "b"]` becomes `foo: "a", foo_1: "b"`.
+    This function groups similar properties in a Json object into list properties.
+    It identifies similar properties based on their base names
+    and creates array for them.
 
     Args:
-        json (dict): The input Json object to decompose.
+        json (dict): The input Json object to factorize.
 
     Returns:
-        (dict): A decomposed Json object with expanded properties.
+        (dict): A factorized Json object with grouped properties.
     """
-    json = copy.deepcopy(json)
-    result_json = {}
-
-    for prop_key, prop_value in json.items():
-        if is_plural(prop_key) and isinstance(prop_value, list):
-            singular_key = to_singular_without_numerical_suffix(prop_key)
-            for i, item in enumerate(prop_value):
-                if i == 0:
-                    result_json[singular_key] = item
-                else:
-                    result_json[add_suffix(singular_key, i)] = item
-        else:
-            result_json[prop_key] = prop_value
-
-    return result_json
+    if synaops:
+        return synaops.factorize_json(json=json)
+    return _py_factorize_json(json=json)
 
 
-def out_mask_json(json, mask=None, pattern=None, recursive=True):
+def _py_out_mask_json(json, mask=None, pattern=None, recursive=True):
     """Mask specific fields of a Json object.
 
     This function look for properties to mask and remove them.
@@ -198,7 +231,40 @@ def out_mask_json(json, mask=None, pattern=None, recursive=True):
     return json
 
 
-def in_mask_json(json, mask=None, pattern=None, recursive=True):
+def out_mask_json(json, mask=None, pattern=None, recursive=True):
+    """Mask specific fields of a Json object.
+
+    This function look for properties to mask and remove them.
+    It ignores the suffixes that other operations could add.
+
+    Args:
+        json (dict): The input Json object to mask.
+        mask (list): The base key list to remove.
+        pattern (str): Optional. A regex pattern to match property keys
+            to remove. If provided, properties whose base key matches
+            the pattern will be removed.
+        recursive (bool): Whether or not to remove
+            recursively for nested objects (default True).
+
+    Returns:
+        (dict): A masked Json object with removed properties.
+    """
+    if synaops:
+        return synaops.out_mask_json(
+            json=json,
+            mask=mask,
+            pattern=pattern,
+            recursive=recursive,
+        )
+    return _py_out_mask_json(
+        json=json,
+        mask=mask,
+        pattern=pattern,
+        recursive=recursive,
+    )
+
+
+def _py_in_mask_json(json, mask=None, pattern=None, recursive=True):
     """Keep specific fields of a Json object.
 
     This function looks for properties to keep and removes all others.
@@ -245,7 +311,13 @@ def in_mask_json(json, mask=None, pattern=None, recursive=True):
                 if isinstance(prop_value, dict):
                     stack.append(prop_value)
                 elif isinstance(prop_value, list):
-                    keys_to_keep.append(prop_key)
+                    # Recurse into list items so a kept array's items are
+                    # masked too, but do NOT force-keep the array key itself:
+                    # like objects, an array is kept only when its key matches
+                    # the mask/pattern. Force-keeping arrays made the value
+                    # masker disagree with the schema masker (which drops
+                    # unmatched arrays), leaving stray list fields on the
+                    # output and breaking, e.g., ExactMatch field comparisons.
                     for item in prop_value:
                         if isinstance(item, dict):
                             stack.append(item)
@@ -255,3 +327,36 @@ def in_mask_json(json, mask=None, pattern=None, recursive=True):
             del current[key]
 
     return json
+
+
+def in_mask_json(json, mask=None, pattern=None, recursive=True):
+    """Keep specific fields of a Json object.
+
+    This function looks for properties to keep and removes all others.
+    It ignores the suffixes that other operations could add.
+
+    Args:
+        json (dict): The input Json object to mask.
+        mask (list): The base key list to keep.
+        pattern (str): Optional. A regex pattern to match property keys
+            to keep. If provided, properties whose base key matches
+            the pattern will be kept.
+        recursive (bool): Whether or not to keep
+            recursively for nested objects (default True).
+
+    Returns:
+        (dict): A masked Json object with only the specified properties.
+    """
+    if synaops:
+        return synaops.in_mask_json(
+            json=json,
+            mask=mask,
+            pattern=pattern,
+            recursive=recursive,
+        )
+    return _py_in_mask_json(
+        json=json,
+        mask=mask,
+        pattern=pattern,
+        recursive=recursive,
+    )

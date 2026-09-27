@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import collections
 import copy
@@ -8,6 +8,13 @@ from synalinks.src.utils.nlp_utils import add_suffix
 from synalinks.src.utils.nlp_utils import is_plural
 from synalinks.src.utils.nlp_utils import to_plural_without_numerical_suffix
 from synalinks.src.utils.nlp_utils import to_singular_without_numerical_suffix
+
+# Try to import rust based utils (faster)
+# while defaulting to python based one
+try:
+    import synaops
+except ImportError:
+    synaops = None
 
 
 def standardize_schema(schema):
@@ -24,8 +31,7 @@ def _default_title_from_key(key: str) -> str:
     return key.replace("_", " ").title()
 
 
-def prefix_schema(schema, prefix):
-    """Add a prefix to the schema properties"""
+def _py_prefix_schema(schema, prefix):
     schema = copy.deepcopy(schema)
     new_properties = {}
 
@@ -39,8 +45,14 @@ def prefix_schema(schema, prefix):
     return schema
 
 
-def suffix_schema(schema, suffix):
-    """Add a suffix to the schema properties"""
+def prefix_schema(schema, prefix):
+    """Add a prefix to the schema properties"""
+    if synaops:
+        return synaops.prefix_schema(schema=schema, prefix=prefix)
+    return _py_prefix_schema(schema=schema, prefix=prefix)
+
+
+def _py_suffix_schema(schema, suffix):
     schema = copy.deepcopy(schema)
     new_properties = {}
 
@@ -52,6 +64,13 @@ def suffix_schema(schema, suffix):
     schema["properties"] = new_properties
     schema["required"] = list(new_properties.keys())
     return schema
+
+
+def suffix_schema(schema, suffix):
+    """Add a suffix to the schema properties"""
+    if synaops:
+        return synaops.suffix_schema(schema=schema, suffix=suffix)
+    return _py_suffix_schema(schema=schema, suffix=suffix)
 
 
 def is_schema_equal(schema1, schema2):
@@ -92,7 +111,7 @@ def is_array(schema):
     return False
 
 
-def concatenate_schema(schema1, schema2):
+def _py_concatenate_schema(schema1, schema2):
     """Concatenate two JSON schemas into a single schema.
 
     This function merges the properties of two JSON schemas into a single schema.
@@ -164,7 +183,31 @@ def concatenate_schema(schema1, schema2):
     return result_schema
 
 
-def factorize_schema(schema):
+def concatenate_schema(schema1, schema2):
+    """Concatenate two JSON schemas into a single schema.
+
+    This function merges the properties of two JSON schemas into a single schema.
+    If there are conflicting property names, it appends a suffix to make them unique.
+
+    Args:
+        schema1 (dict): The first JSON schema to be concatenated.
+        schema2 (dict): The second JSON schema to be concatenated.
+
+    Returns:
+        (dict): A new JSON schema that combines the properties of the input schemas.
+    """
+    if synaops:
+        return synaops.concatenate_schema(
+            schema1=schema1,
+            schema2=schema2,
+        )
+    return _py_concatenate_schema(
+        schema1=schema1,
+        schema2=schema2,
+    )
+
+
+def _py_factorize_schema(schema):
     """Factorize a JSON schema by grouping similar properties into lists.
 
     This function groups similar properties in a JSON schema into list properties.
@@ -233,7 +276,12 @@ def factorize_schema(schema):
                     else:
                         array_prop["items"] = prop_value["items"]
                 else:
-                    array_prop["items"] = {"type": prop_value["type"]}
+                    if "$ref" in prop_value:
+                        array_prop["items"] = {"$ref": prop_value["$ref"]}
+                    elif "type" in prop_value:
+                        array_prop["items"] = {"type": prop_value["type"]}
+                    else:
+                        array_prop["items"] = {"type": "string"}
 
                 result_schema["properties"][plural_key] = array_prop
                 if plural_key not in result_schema["required"]:
@@ -250,70 +298,26 @@ def factorize_schema(schema):
     return result_schema
 
 
-def decompose_schema(schema):
-    """Decompose a JSON schema by expanding list properties into individuals.
+def factorize_schema(schema):
+    """Factorize a JSON schema by grouping similar properties into lists.
 
-    This is the inverse of factorize_schema. It takes array properties and
-    expands them into individual properties with numerical suffixes.
-    For example a `foos` array of strings becomes `foo: str, foo_1: str`.
-
-    Note: Since the schema doesn't carry information about how many items
-    the array contained, this produces exactly two individual properties
-    (the base and one suffixed) for each array property.
+    This function groups similar properties in a JSON schema into list properties.
+        It identifies similar properties based on their base names
+        and creates array properties for them. The grouped properties are renamed in
+        their plural form.
 
     Args:
-        schema (dict): The input JSON schema to decompose.
+        schema (dict): The input JSON schema to factorize.
 
     Returns:
-        (dict): A decomposed JSON schema with expanded properties.
+        (dict): A factorized JSON schema with grouped properties.
     """
-    schema = copy.deepcopy(schema)
-    result_schema = {
-        "additionalProperties": False,
-        "properties": {},
-        "required": [],
-        "title": schema.get("title"),
-        "type": "object",
-    }
-
-    if schema.get("$defs"):
-        result_schema["$defs"] = schema.get("$defs")
-
-    schema_properties = schema.get("properties", {})
-
-    for prop_key, prop_value in schema_properties.items():
-        if is_plural(prop_key) and is_array(prop_value):
-            singular_key = to_singular_without_numerical_suffix(prop_key)
-            item_schema = prop_value.get("items", {})
-            # Create the base property
-            base_prop = copy.deepcopy(item_schema)
-            base_prop["title"] = singular_key.replace("_", " ").title()
-            if "description" in prop_value:
-                base_prop["description"] = prop_value["description"]
-            result_schema["properties"][singular_key] = base_prop
-            if singular_key not in result_schema["required"]:
-                result_schema["required"].append(singular_key)
-            # Create the suffixed property
-            suffixed_key = add_suffix(singular_key, 1)
-            suffixed_prop = copy.deepcopy(item_schema)
-            suffixed_prop["title"] = suffixed_key.replace("_", " ").title()
-            if "description" in prop_value:
-                suffixed_prop["description"] = prop_value["description"]
-            result_schema["properties"][suffixed_key] = suffixed_prop
-            if suffixed_key not in result_schema["required"]:
-                result_schema["required"].append(suffixed_key)
-        else:
-            result_schema["properties"][prop_key] = prop_value
-            if prop_key not in result_schema["required"]:
-                result_schema["required"].append(prop_key)
-
-    if "$defs" in result_schema and len(result_schema.get("$defs")) == 0:
-        del result_schema["$defs"]
-
-    return result_schema
+    if synaops:
+        return synaops.factorize_schema(schema=schema)
+    return _py_factorize_schema(schema=schema)
 
 
-def out_mask_schema(schema, mask=None, pattern=None, recursive=True):
+def _py_out_mask_schema(schema, mask=None, pattern=None, recursive=True):
     """Mask specific fields of a JSON schema.
 
     This function looks for properties to mask and removes them.
@@ -391,7 +395,40 @@ def out_mask_schema(schema, mask=None, pattern=None, recursive=True):
     return schema
 
 
-def in_mask_schema(schema, mask=None, pattern=None, recursive=True):
+def out_mask_schema(schema, mask=None, pattern=None, recursive=True):
+    """Mask specific fields of a JSON schema.
+
+    This function looks for properties to mask and removes them.
+    It ignores the suffixes that other operations could add.
+
+    Args:
+        schema (dict): The input JSON schema to mask.
+        mask (list): The base key list to remove.
+        pattern (str): Optional. A regex pattern to match property keys
+            to remove. If provided, properties whose base key matches
+            the pattern will be removed.
+        recursive (bool): Whether or not to remove
+            recursively for nested objects (default True).
+
+    Returns:
+        (dict): A masked JSON schema with removed properties.
+    """
+    if synaops:
+        return synaops.out_mask_schema(
+            schema=schema,
+            mask=mask,
+            pattern=pattern,
+            recursive=recursive,
+        )
+    return _py_out_mask_schema(
+        schema=schema,
+        mask=mask,
+        pattern=pattern,
+        recursive=recursive,
+    )
+
+
+def _py_in_mask_schema(schema, mask=None, pattern=None, recursive=True):
     """Keep specific fields of a JSON schema.
 
     This function looks for properties to keep and removes all others.
@@ -476,3 +513,36 @@ def in_mask_schema(schema, mask=None, pattern=None, recursive=True):
         schema["$defs"] = new_defs
 
     return schema
+
+
+def in_mask_schema(schema, mask=None, pattern=None, recursive=True):
+    """Keep specific fields of a JSON schema.
+
+    This function looks for properties to keep and removes all others.
+    It ignores the suffixes that other operations could add.
+
+    Args:
+        schema (dict): The input JSON schema to mask.
+        mask (list): The base key list to keep.
+        pattern (str): Optional. A regex pattern to match property keys
+            to keep. If provided, properties whose base key matches
+            the pattern will be kept.
+        recursive (bool): Whether or not to keep
+            recursively for nested objects (default True).
+
+    Returns:
+        (dict): A masked JSON schema with only the specified properties.
+    """
+    if synaops:
+        return synaops.in_mask_schema(
+            schema=schema,
+            mask=mask,
+            pattern=pattern,
+            recursive=recursive,
+        )
+    return _py_in_mask_schema(
+        schema=schema,
+        mask=mask,
+        pattern=pattern,
+        recursive=recursive,
+    )

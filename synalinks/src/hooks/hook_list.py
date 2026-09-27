@@ -1,14 +1,14 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 
 from synalinks.src import tree
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend.config import is_observability_enabled
-from synalinks.src.backend.config import is_telemetry_enabled
+from synalinks.src.backend.config import is_trace_recording_enabled
 from synalinks.src.hooks.hook import Hook
 from synalinks.src.hooks.logger import Logger
 from synalinks.src.hooks.monitor import Monitor
-from synalinks.src.hooks.telemetry import Telemetry
+from synalinks.src.hooks.recorder import Recorder
 
 
 @synalinks_export("synalinks.hooks.HookList")
@@ -56,15 +56,15 @@ class HookList(Hook):
     def _add_default_hooks(self, add_logger):
         self._logger = None
         self._monitor = None
-        self._telemetry = None
+        self._recorder = None
 
         for hook in self.hooks:
             if isinstance(hook, Logger):
                 self._logger = hook
             elif isinstance(hook, Monitor):
                 self._monitor = hook
-            elif isinstance(hook, Telemetry):
-                self._telemetry = hook
+            elif isinstance(hook, Recorder):
+                self._recorder = hook
 
         if self._logger is None and add_logger:
             self._logger = Logger()
@@ -74,9 +74,9 @@ class HookList(Hook):
             self._monitor = Monitor()
             self.hooks.append(self._monitor)
 
-        if self._telemetry is None and is_telemetry_enabled():
-            self._telemetry = Telemetry()
-            self.hooks.append(self._telemetry)
+        if self._recorder is None and is_trace_recording_enabled():
+            self._recorder = Recorder()
+            self.hooks.append(self._recorder)
 
     def set_module(self, module):
         if not module:

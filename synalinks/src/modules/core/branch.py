@@ -1,23 +1,39 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import asyncio
+import inspect
 
 from synalinks.src import ops
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.modules.core.decision import Decision
+from synalinks.src.modules.decision_models import resolve_decision_model
+from synalinks.src.modules.language_models import get as _get_lm
 from synalinks.src.modules.module import Module
 from synalinks.src.saving import serialization_lib
 
 
 @synalinks_export(["synalinks.modules.Branch", "synalinks.Branch"])
 class Branch(Module):
-    """Use a `LanguageModel` to select which module to call based on an arbitrary
-        input, a question and a list of labels.
+    """Use a `LanguageModel` to select which module(s) to call based on an
+        arbitrary input, a question and a list of labels.
 
-    The selected branch output the data model computed using
-    the inputs and module's branch, while the others output `None`.
+    The selected branch(es) output the data model computed using the inputs
+    and module's branch, while the others output `None`. The output is
+    always a tuple of length `len(branches)` so each label has a fixed
+    positional slot regardless of which one was selected.
 
-    Example:
+    The behaviour of the selector depends on `decision_type`:
+
+    - `decision_type=Decision` (default): exactly **one** branch is
+      selected per call. All other slots are `None`.
+    - `decision_type=MultiDecision`: **one or more** branches are
+      selected per call. Non-selected slots remain `None`. Use this for
+      multi-label routing where several branches may need to fire at
+      once (e.g., an article that spans both `science` and `finance`,
+      or a query that should be answered by both a retrieval and a
+      tool-using sub-program).
+
+    Single-label example (one branch active per call):
 
     ```python
     import synalinks
@@ -68,6 +84,65 @@ class Branch(Module):
         asyncio.run(main())
     ```
 
+    Multi-label example (zero, one, or several branches active per call):
+
+    ```python
+    import synalinks
+    import asyncio
+
+    async def main():
+        class Article(synalinks.DataModel):
+            text: str
+
+        class ScienceSummary(synalinks.DataModel):
+            thinking: str
+            science_summary: str
+
+        class FinanceSummary(synalinks.DataModel):
+            thinking: str
+            finance_summary: str
+
+        class SportsSummary(synalinks.DataModel):
+            thinking: str
+            sports_summary: str
+
+        language_model = synalinks.LanguageModel(model="ollama/mistral")
+
+        x0 = synalinks.Input(data_model=Article)
+        # Each label has a fixed slot in the output tuple. With
+        # MultiDecision, several may be populated at once; the rest
+        # are None.
+        (sci, fin, spo) = await synalinks.Branch(
+            question="Which topics does this article cover?",
+            labels=["science", "finance", "sports"],
+            branches=[
+                synalinks.Generator(
+                    data_model=ScienceSummary,
+                    language_model=language_model,
+                ),
+                synalinks.Generator(
+                    data_model=FinanceSummary,
+                    language_model=language_model,
+                ),
+                synalinks.Generator(
+                    data_model=SportsSummary,
+                    language_model=language_model,
+                ),
+            ],
+            decision_type=synalinks.MultiDecision,
+            language_model=language_model,
+        )(x0)
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+    ```
+
+    For a biotech-startup article the result might be
+    `(<ScienceSummary>, <FinanceSummary>, None)`: `science` and
+    `finance` are both active, `sports` stays `None`. The non-active
+    slots can be combined downstream with `|` (logical OR) the same
+    way as in the single-label example.
+
     Args:
         question (str): The question to ask.
         labels (list): The list of labels to choose from (strings).
@@ -85,6 +160,12 @@ class Branch(Module):
         seed_instructions (list): Optional. A list of instructions to use as seed for the
             optimization. If not provided, use the default instructions as seed.
         temperature (float): Optional. The temperature for the LM call.
+        max_tokens (int): Optional. Default None (model's own default). Caps the
+            generation length.
+        top_p (float): Optional. Default None (model's own default). Nucleus
+            sampling probability.
+        top_k (int): Optional. Default None (model's own default). Top-k sampling
+            cutoff.
         reasoning_effort (string): Optional. The reasoning effort for the LM call
             between ['minimal', 'low', 'medium', 'high', 'disable', 'none', None].
             Default to None (no reasoning).
@@ -92,14 +173,27 @@ class Branch(Module):
             schema in the decision prompt (Default to False) (see `Decision`).
         use_outputs_schema (bool): Optional. Whether or not use the outputs
             schema in the decision prompt (Default to False) (see `Decision`).
-        decision_type (bool): Optional. The type of decision module to use.
+        decision_type (type): Optional. The decision module class. Defaults to
+            `Decision` (single-label, exactly one branch active). Pass
+            `MultiDecision` to enable multi-label routing where several
+            branches may be active simultaneously.
         name (str): Optional. The name of the module.
         description (str): Optional. The description of the module.
         trainable (bool): Whether the module's variables should be trainable.
+        decision_model (DecisionModel): Optional. A decision model to decide
+            which branch to take, instead of the language model (see
+            `Decision`). The branches keep their own models.
+        min_confidence (float): Optional. With a decision model and a
+            `Decision`, the confidence under which no branch is selected
+            (see `Decision`).
+        threshold (float): Optional. With a decision model and a
+            `MultiDecision`, the probability from which a branch is selected
+            (see `MultiDecision`).
     """
 
     def __init__(
         self,
+        *,
         question=None,
         labels=None,
         branches=None,
@@ -110,7 +204,10 @@ class Branch(Module):
         examples=None,
         instructions=None,
         seed_instructions=None,
-        temperature=0.0,
+        temperature=None,
+        max_tokens=None,
+        top_p=None,
+        top_k=None,
         reasoning_effort=None,
         use_inputs_schema=False,
         use_outputs_schema=False,
@@ -118,6 +215,9 @@ class Branch(Module):
         name=None,
         description=None,
         trainable=True,
+        decision_model=None,
+        min_confidence=None,
+        threshold=None,
         **kwargs,
     ):
         super().__init__(
@@ -136,15 +236,37 @@ class Branch(Module):
         self.branches = {labels[i]: m for i, m in enumerate(branches)}
         self.inject_decision = inject_decision
         self.return_decision = return_decision
-        self.language_model = language_model
+        # Resolved here, from the arguments as given: the decision module
+        # receives the resolved language model, so it could not tell the
+        # default decision model apart from an explicit language model.
+        resolved_decision_model = resolve_decision_model(decision_model, language_model)
+        self.language_model = _get_lm(language_model)
         self.prompt_template = prompt_template
         self.examples = examples
         self.instructions = instructions
         self.seed_instructions = seed_instructions
         self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.top_k = top_k
         self.reasoning_effort = reasoning_effort
         self.use_inputs_schema = use_inputs_schema
         self.use_outputs_schema = use_outputs_schema
+        # Only given when set, so a custom `decision_type` without decision
+        # model support keeps working (the default decision model is only
+        # given to a `decision_type` that takes one).
+        decision_model_kwargs = {}
+        if decision_model is not None or (
+            resolved_decision_model is not None
+            and "decision_model" in inspect.signature(decision_type).parameters
+        ):
+            decision_model_kwargs["decision_model"] = resolved_decision_model
+        # Also only given when set: `min_confidence` is a `Decision` argument,
+        # `threshold` a `MultiDecision` one.
+        if min_confidence is not None:
+            decision_model_kwargs["min_confidence"] = min_confidence
+        if threshold is not None:
+            decision_model_kwargs["threshold"] = threshold
         self.decision = decision_type(
             question=self.question,
             labels=self.labels,
@@ -154,11 +276,18 @@ class Branch(Module):
             instructions=self.instructions,
             seed_instructions=self.seed_instructions,
             temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            top_p=self.top_p,
+            top_k=self.top_k,
             reasoning_effort=self.reasoning_effort,
             use_inputs_schema=self.use_inputs_schema,
             use_outputs_schema=self.use_outputs_schema,
             name="decision_" + self.name,
+            **decision_model_kwargs,
         )
+        self.decision_model = getattr(self.decision, "decision_model", None)
+        self.min_confidence = min_confidence
+        self.threshold = threshold
 
     async def call(self, inputs, training=False):
         outputs = [None] * len(self.branches)
@@ -269,9 +398,14 @@ class Branch(Module):
             "instructions": self.instructions,
             "seed_instructions": self.seed_instructions,
             "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
             "reasoning_effort": self.reasoning_effort,
             "use_inputs_schema": self.use_inputs_schema,
             "use_outputs_schema": self.use_outputs_schema,
+            "min_confidence": self.min_confidence,
+            "threshold": self.threshold,
             "name": self.name,
             "description": self.description,
             "trainable": self.trainable,
@@ -281,6 +415,10 @@ class Branch(Module):
                 self.language_model
             )
         }
+        if self.decision_model is not None:
+            language_model_config["decision_model"] = (
+                serialization_lib.serialize_synalinks_object(self.decision_model)
+            )
         branches_config = {
             "branches": [
                 serialization_lib.serialize_synalinks_object(branch)
@@ -294,6 +432,10 @@ class Branch(Module):
         language_model = serialization_lib.deserialize_synalinks_object(
             config.pop("language_model")
         )
+        if "decision_model" in config:
+            config["decision_model"] = serialization_lib.deserialize_synalinks_object(
+                config.pop("decision_model"),
+            )
         branches = [
             serialization_lib.deserialize_synalinks_object(
                 branch_config, custom_objects=custom_objects

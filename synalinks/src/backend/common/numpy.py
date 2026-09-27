@@ -1,6 +1,6 @@
 # Modified from: keras/src/backend/numpy/numpy.py
 # Original authors: François Chollet et al. (Keras Team)
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 # Because we only use tensors for metrics and rewards, we don't need much
 # and because we don't perform any gradient descent
@@ -108,3 +108,46 @@ def normalize(x, axis=-1, order=2):
     # axis cannot be `None`
     axis = axis or -1
     return x / np.expand_dims(norm, axis)
+
+
+def exp(x):
+    x = convert_to_tensor(x)
+    return np.exp(x).astype(floatx())
+
+
+def log(x):
+    x = convert_to_tensor(x)
+    return np.log(x).astype(floatx())
+
+
+def sqrt(x):
+    x = convert_to_tensor(x)
+    return np.sqrt(x).astype(floatx())
+
+
+def abs(x):
+    x = convert_to_tensor(x)
+    return np.abs(x).astype(floatx())
+
+
+def max(x, axis=None, keepdims=False):
+    axis = standardize_axis_for_numpy(axis)
+    x = convert_to_tensor(x)
+    return np.max(x, axis=axis, keepdims=keepdims).astype(floatx())
+
+
+def min(x, axis=None, keepdims=False):
+    axis = standardize_axis_for_numpy(axis)
+    x = convert_to_tensor(x)
+    return np.min(x, axis=axis, keepdims=keepdims).astype(floatx())
+
+
+def std(x, axis=None, keepdims=False, ddof=0):
+    axis = standardize_axis_for_numpy(axis)
+    x = convert_to_tensor(x)
+    return np.std(x, axis=axis, keepdims=keepdims, ddof=ddof).astype(floatx())
+
+
+def clip(x, x_min, x_max):
+    x = convert_to_tensor(x)
+    return np.clip(x, x_min, x_max).astype(floatx())

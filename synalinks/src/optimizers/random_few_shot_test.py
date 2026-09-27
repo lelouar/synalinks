@@ -1,11 +1,11 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from unittest.mock import patch
 
 from synalinks.src import testing
-from synalinks.src.language_models import LanguageModel
 from synalinks.src.modules import Generator
 from synalinks.src.modules import Input
+from synalinks.src.modules.language_models import LanguageModel
 from synalinks.src.optimizers.random_few_shot import RandomFewShot
 from synalinks.src.programs import Program
 from synalinks.src.rewards.exact_match import ExactMatch
@@ -60,3 +60,10 @@ class RandomFewShotTest(testing.TestCase):
 
         program_vars = program.get_variable(index=0).get_json()
         self.assertTrue(len(program_vars["examples"]) > 0)
+        # The optimizer must record at least one entry into `history`
+        # over the training run; entries should be `reward`-free
+        # snapshots of the best candidate at each epoch.
+        history = program_vars["history"]
+        self.assertTrue(len(history) > 0)
+        for entry in history:
+            self.assertNotIn("reward", entry)

@@ -1,8 +1,12 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from synalinks.src import ops
 from synalinks.src.api_export import synalinks_export
+from synalinks.src.backend.pydantic.metrics import FineScore
+from synalinks.src.backend.pydantic.metrics import get_score_type
+from synalinks.src.backend.pydantic.metrics import serialize_score_type
 from synalinks.src.modules import SelfCritique
+from synalinks.src.modules.ttc.self_critique import CritiqueWithReward
 from synalinks.src.programs import Program
 from synalinks.src.rewards.reward_wrappers import ProgramAsJudge
 from synalinks.src.saving import serialization_lib
@@ -18,6 +22,8 @@ class LMAsJudgeProgram(Program):
         examples (list): The default examples to use in the prompt
             (see `Generator`).
         instructions (list): The default instructions to use (see `Generator`).
+        score_type (type | str): Optional. The scale the judge picks the reward
+            from (see `SelfCritique`); the reward is normalized to 0.0..1.0.
         name (str): Optional. The name of the program.
         description (str): Optional. The description of the program.
         trainable (bool): Whether the program's variables should be trainable.
@@ -29,6 +35,7 @@ class LMAsJudgeProgram(Program):
         prompt_template=None,
         examples=None,
         instructions=None,
+        score_type=None,
         name=None,
         description=None,
         trainable=True,
@@ -38,11 +45,13 @@ class LMAsJudgeProgram(Program):
             description=description,
             trainable=trainable,
         )
+        self.score_type = get_score_type(score_type or FineScore)
         self.critique = SelfCritique(
             language_model=language_model,
             prompt_template=prompt_template,
             examples=examples,
             instructions=instructions,
+            score_type=self.score_type,
             name="self_critique_" + self.name,
         )
         self.language_model = language_model
@@ -58,7 +67,13 @@ class LMAsJudgeProgram(Program):
         y_true = inputs[0]
         y_pred = inputs[1]
         if not y_pred:
-            return 0.0
+            # No prediction to judge; return a reward-bearing data model
+            # (the `ProgramAsJudge` contract) rather than a bare float, which
+            # the wrapper would reject with `'float' has no attribute 'get'`.
+            return CritiqueWithReward(
+                critique="Empty prediction: nothing to evaluate.",
+                reward=0.0,
+            ).to_json_data_model()
         if y_true:
             y_true = await ops.prefix(
                 y_true,
@@ -80,6 +95,7 @@ class LMAsJudgeProgram(Program):
             "prompt_template": self.prompt_template,
             "examples": self.examples,
             "instructions": self.instructions,
+            "score_type": serialize_score_type(self.score_type),
             "name": self.name,
             "description": self.description,
             "trainable": self.trainable,
@@ -133,9 +149,19 @@ class LMAsJudge(ProgramAsJudge):
         instructions (list): The default instructions to use (see `Generator`).
         examples (list): The default examples to use in the prompt
             (see `Generator`).
+        score_type (type | str): Optional. The scale the judge picks the reward
+            from: `synalinks.FineScore` (default), `synalinks.Score`,
+            `synalinks.Rating`, `synalinks.Rating10`, `synalinks.Rating20`, any
+            `Enum` whose members are `int` or `float`, or the name of one of them.
+            The reward is always normalized to a float between 0.0 and 1.0.
+        reduction (str): Optional. The reward reduction (Default to `"mean"`).
         name (str): Optional. string name of the reward instance.
         in_mask (list): Optional. list of keys to keep to compute the reward.
         out_mask (list): Optional. list of keys to remove to compute the reward.
+        in_mask_pattern (str): Optional. Regex pattern; fields whose names match
+            are kept (combined with ``in_mask`` via OR).
+        out_mask_pattern (str): Optional. Regex pattern; fields whose names match
+            are dropped (combined with ``out_mask`` via OR).
     """
 
     def __init__(
@@ -144,19 +170,40 @@ class LMAsJudge(ProgramAsJudge):
         prompt_template=None,
         examples=None,
         instructions=None,
+        score_type=None,
+        reduction="mean",
         name="lm_as_judge",
         in_mask=None,
         out_mask=None,
+        in_mask_pattern=None,
+        out_mask_pattern=None,
     ):
         program = LMAsJudgeProgram(
             language_model=language_model,
             prompt_template=prompt_template,
             examples=examples,
             instructions=instructions,
+            score_type=score_type,
         )
         super().__init__(
             program=program,
+            reduction=reduction,
             name=name,
             in_mask=in_mask,
             out_mask=out_mask,
+            in_mask_pattern=in_mask_pattern,
+            out_mask_pattern=out_mask_pattern,
+        )
+
+    @classmethod
+    def from_config(cls, config):
+        config = dict(config)
+        program = serialization_lib.deserialize_synalinks_object(config.pop("program"))
+        return cls(
+            language_model=program.language_model,
+            prompt_template=program.prompt_template,
+            examples=program.examples,
+            instructions=program.instructions,
+            score_type=program.score_type,
+            **config,
         )

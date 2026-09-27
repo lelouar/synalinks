@@ -1,12 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
-
-import asyncio
-import copy
-import sys
-import traceback
-from io import StringIO
-from multiprocessing import Process
-from multiprocessing import Queue
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import jsonschema
 from jsonschema import ValidationError
@@ -19,19 +11,50 @@ from synalinks.src.backend import JsonDataModel
 from synalinks.src.backend import SymbolicDataModel
 from synalinks.src.backend import Trainable
 from synalinks.src.modules.module import Module
-
-
-class TimeoutException(Exception):
-    """Exception raised when script execution times out"""
-
-    pass
+from synalinks.src.sandboxes.mirage_sandbox import MirageSandbox
+from synalinks.src.sandboxes.sandbox import TimeoutException
+from synalinks.src.saving import serialization_lib
+from synalinks.src.saving.object_registration import get_registered_name
+from synalinks.src.saving.object_registration import get_registered_object
 
 
 class PythonScript(Trainable):
-    """The python code to transform a JSON object into another JSON object"""
+    """The python code to transform a JSON object into another JSON object.
+
+    The script is executed inside the active sandbox (by default a
+    ``MirageSandbox``, a real Python 3 interpreter). Scripts must observe the
+    following constraints:
+
+    - The input JSON object is exposed as a dict named ``inputs``; the script
+      must assign the output JSON object to a variable named ``result`` before
+      it ends.
+    - The full standard library is importable, along with any third-party
+      packages installed in the environment, and ``class`` / ``match``
+      statements are supported: write ordinary Python.
+    - Tools bound to the module are exposed as **global functions** under
+      their tool name: call them directly. Every tool call returns a
+      **dict**: a tool wrapping ``def f(x) -> int`` yields
+      ``{"result": <value>}``, a tool that already returns a dict yields
+      that dict directly. For example, with a bound tool ``web_search``:
+
+      ```python
+      hits = web_search(query=inputs.get("q"))
+      # hits is a dict: index the field you need
+      result = {"answer": hits["results"][0]["title"]}
+      ```
+    - Execution is bounded by the module's ``timeout``; long-running scripts
+      are aborted. The exact language and stdlib constraints ultimately depend
+      on the active sandbox (consult ``sandbox.description``).
+    """
 
     python_script: str = Field(
-        description="The python script to transform a JSON object into another object"
+        description=(
+            "A Python script that transforms a JSON input into a JSON "
+            "output. The script reads the input from a dict named "
+            "`inputs` and must assign the output dict to a variable "
+            "named `result` before it ends. Exact language and stdlib "
+            "constraints depend on the active sandbox."
+        ),
     )
 
 
@@ -40,64 +63,99 @@ class PythonConsoleLog(DataModel):
     stderr: str = Field(description="The python console's stderr")
 
 
-def _execute_script_in_process(python_script, inputs_json, schema, result_queue):
-    """Execute the script in a separate process.
-
-    This function runs in a separate process and can be forcefully terminated.
+def _adapt_tool_for_sandbox(tool):
+    """Route a sandbox tool call through the `Tool` Module (preserving
+    observability/retry) and return a plain dict the sandbox can marshal back.
     """
-    result = None
 
-    # Capture stdout and stderr
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    stdout_capture = StringIO()
-    stderr_capture = StringIO()
-    sys.stdout = stdout_capture
-    sys.stderr = stderr_capture
+    async def adapter(**kwargs):
+        result = await tool(**kwargs)
+        if result is None:
+            return None
+        if hasattr(result, "get_json"):
+            return result.get_json()
+        return result
+
+    return adapter
+
+
+def _relabel_error(error: str) -> str:
+    """Translate a sandbox error class name into the module's legacy label.
+
+    ``MirageSandbox`` surfaces errors as plain Python ``"XxxError: ..."``; the
+    historical contract of this module is ``"Syntax Error: ..."`` /
+    ``"Runtime Error: ..."`` (matching the rest of the stdout/stderr).
+    """
+    head, _, rest = error.partition(":")
+    label = "Syntax Error" if head == "SyntaxError" else "Runtime Error"
+    return f"{label}:{rest}"
+
+
+async def _run_script(
+    python_script,
+    inputs_json,
+    schema,
+    timeout,
+    tools,
+    sandbox=None,
+    sandbox_type=MirageSandbox,
+):
+    """Execute the script inside the sandbox.
+
+    The script contract is unchanged: assign the output to a variable named
+    ``result``. A trailing ``result`` expression is appended so the
+    sandbox's last-expression return captures that value.
+
+    ``tools`` is a ``{name: Tool}`` mapping; each ``Tool`` is exposed as a
+    plain synchronous global function inside the sandbox (called directly,
+    no ``await``).
+
+    ``sandbox`` is optional. When ``None``, a fresh ``MirageSandbox`` is
+    built for just this call (the normal case), giving every input an
+    independent namespace. When supplied, the caller owns the sandbox
+    and state persists across calls (useful at training time to explore
+    scripts that build on each other).
+    """
+    code = python_script + "\nresult\n"
+    if sandbox is None:
+        sandbox = sandbox_type(timeout=timeout)
+    external_functions = (
+        {name: _adapt_tool_for_sandbox(tool) for name, tool in tools.items()}
+        if tools
+        else None
+    )
 
     try:
-        # Create a local namespace with the inputs
-        local_namespace = {"inputs": copy.deepcopy(inputs_json)}
+        execution = await sandbox.run_code(
+            code,
+            inputs={"inputs": inputs_json},
+            external_functions=external_functions,
+        )
+    except TimeoutException as exc:
+        # E2B raises on a timeout; the script's output is an error like any.
+        return None, "", f"{_relabel_error(f'TimeoutError: {exc}')}\n"
 
-        # Execute the entire script
-        exec(python_script, local_namespace)
+    stdout = "".join(execution.logs.stdout)
+    stderr = "".join(execution.logs.stderr)
+    error = execution.error
+    if error:
+        relabelled = _relabel_error(f"{error.name}: {error.value}")
+        # Syntax errors happen at compile time; no script output precedes them.
+        if error.name == "SyntaxError":
+            return None, "", f"{relabelled}\n"
+        return None, stdout, stderr + error.traceback + f"{relabelled}\n"
 
-        # Look for the result variable in the namespace
-        if "result" in local_namespace:
-            result = local_namespace["result"]
+    main = next((r for r in execution.results if r.is_main_result), None)
+    result = main.json if main else None
+    if not result:
+        return None, stdout, stderr
 
-            if result:
-                try:
-                    jsonschema.validate(result, schema)
-                except ValidationError as validation_error:
-                    stdout = stdout_capture.getvalue()
-                    stderr = (
-                        stderr_capture.getvalue()
-                        + f"Validation Error: {validation_error}\n"
-                    )
-                    result_queue.put((None, stdout, stderr))
-                    return
-        else:
-            stdout = stdout_capture.getvalue()
-            stderr = (
-                stderr_capture.getvalue()
-                + "Error: No 'result' variable found after script execution\n"
-            )
-            result_queue.put((None, stdout, stderr))
-            return
+    try:
+        jsonschema.validate(result, schema)
+    except ValidationError as validation_error:
+        return None, stdout, stderr + f"Validation Error: {validation_error}\n"
 
-    except Exception as e:
-        stdout = stdout_capture.getvalue()
-        stderr = stderr_capture.getvalue() + f"Error: {str(e)}\n{traceback.format_exc()}"
-        result_queue.put((None, stdout, stderr))
-        return
-    finally:
-        stdout = stdout_capture.getvalue()
-        stderr = stderr_capture.getvalue()
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-
-    result_queue.put((result, stdout, stderr))
+    return result, stdout, stderr
 
 
 @synalinks_export(
@@ -109,9 +167,10 @@ def _execute_script_in_process(python_script, inputs_json, schema, result_queue)
 class PythonSynthesis(Module):
     """A code Python code transformation on JSON data.
 
-    **Note**: This module is **NOT** completly safe (yet) for business applications.
-        Its is only provided for reseach purposes on program synthesis.
-        Altought the code don't evolve during inference, so it can't be prompt injected.
+    The script runs inside the active sandbox (by default a ``MirageSandbox``,
+    a real Python 3 interpreter): the full standard library and any installed
+    third-party packages are available, and ``class`` / ``match`` statements
+    are supported. The exact constraints depend on the active sandbox.
 
     This module features a python code as trainable variable, allowing the optimizers
     to refine the code during the training loop based on iterative feedback and
@@ -156,10 +215,6 @@ class PythonSynthesis(Module):
         )
     ```
     
-    If you want to explore the future of neuro-symbolic self-evolving systems, contact us.
-    While these systems are not "hard" to code thanks to Synalinks, they requires 
-    technical knowledge and a deep understanding of multiple AI paradigm.
-
     Args:
         schema (dict): The target JSON schema.
             If not provided use the `data_model` to infer it.
@@ -170,16 +225,52 @@ class PythonSynthesis(Module):
             for the evolution. If not provided, create a seed from the default
             configuration.
         default_return_value (dict): Default return value.
-        return_python_script (bool): Wether or not to return the python script for 
+        return_python_script (bool): Wether or not to return the python script for
             evaluation. (Default to False).
         timeout (int): Maximum execution time in seconds. (Default 5 seconds).
+        tools (list): Optional. A list of `Tool` (or MCP tools) exposed to the
+            script as global functions; scripts call them directly (see the
+            ``PythonScript`` docs). Passing `None` or an empty list means no
+            tools are bound.
+
+            **Naming gotcha**: each tool is registered inside the sandbox
+            under ``tool.name``, which is ``tool._func.__name__``. So
+            ``Tool(_my_helper)`` registers as ``_my_helper`` (underscore
+            preserved) and the script must call ``_my_helper(...)``.
+            Name your tool functions exactly as you want them to appear
+            inside the generated script: rename the function, don't rely
+            on an alias.
+        sandbox (Sandbox): Optional. A pre-built ``Sandbox`` instance to
+            reuse across calls. When supplied, the module will not build
+            its own sandbox at ``call()`` time and ``sandbox_type`` is
+            derived from ``type(sandbox)``. Pass this when the caller
+            owns the sandbox lifecycle and state (variables, imports,
+            function defs) must persist across successive calls, useful
+            at training time when candidate scripts share cached state.
+            When omitted, a fresh sandbox of ``sandbox_type`` is built
+            per call.
+        sandbox_type (type): Optional. The ``Sandbox`` subclass used to
+            build a fresh sandbox per call when no ``sandbox`` is
+            injected. Defaults to ``MirageSandbox``, or to
+            ``type(sandbox)`` when ``sandbox`` is given. Any ``Sandbox``
+            subclass whose ``__init__`` accepts ``(timeout=..., name=...)``
+            works; register custom subclasses with
+            ``@register_synalinks_serializable`` so they round-trip
+            through ``get_config`` / ``from_config``.
         name (str): Optional. The name of the module.
         description (str): Optional. The description of the module.
         trainable (bool): Whether the module's variables should be trainable.
+
+    ``call`` also accepts an optional ``sandbox`` kwarg. The resolution
+    order is: per-call kwarg > constructor-supplied ``sandbox`` > a
+    fresh sandbox of ``sandbox_type``. The first two cases let the
+    caller keep sandbox state alive across calls; the third is the
+    stateless-per-call default.
     """
 
     def __init__(
         self,
+        *,
         schema=None,
         data_model=None,
         python_script=None,
@@ -187,7 +278,9 @@ class PythonSynthesis(Module):
         default_return_value=None,
         return_python_script=False,
         timeout=5,
-        sandbox=False,
+        tools=None,
+        sandbox=None,
+        sandbox_type=None,
         name=None,
         description=None,
         trainable=True,
@@ -219,6 +312,22 @@ class PythonSynthesis(Module):
         self.return_python_script = return_python_script
         self.timeout = timeout
 
+        self.tools = {}
+        if tools:
+            for tool in tools:
+                self.tools[tool.name] = tool
+
+        # Sandbox handling mirrors RecursiveLanguageModelAgent: if a
+        # concrete sandbox is supplied at construction, reuse it across
+        # calls and derive `sandbox_type` from its class. Otherwise fall
+        # back to `sandbox_type` (default MirageSandbox) and build one
+        # fresh per `call()`.
+        self.sandbox = sandbox
+        if sandbox is not None:
+            self.sandbox_type = type(sandbox)
+        else:
+            self.sandbox_type = sandbox_type or MirageSandbox
+
         if not seed_scripts:
             seed_scripts = []
         self.seed_scripts = seed_scripts
@@ -236,51 +345,30 @@ class PythonSynthesis(Module):
             name="state_" + self.name,
         )
 
-    async def execute(self, inputs, python_script):
-        """Execute the Python script with timeout using multiprocessing."""
-        result_queue = Queue()
-
-        process = Process(
-            target=_execute_script_in_process,
-            args=(python_script, inputs.get_json(), self.schema, result_queue),
+    async def execute(self, inputs, python_script, sandbox=None):
+        """Execute the Python script in the sandbox with a timeout."""
+        return await _run_script(
+            python_script,
+            inputs.get_json(),
+            self.schema,
+            self.timeout,
+            self.tools,
+            sandbox=sandbox,
+            sandbox_type=self.sandbox_type,
         )
-        process.start()
 
-        start_time = asyncio.get_event_loop().time()
-        timeout_remaining = self.timeout
-
-        while process.is_alive() and timeout_remaining > 0:
-            await asyncio.sleep(0.1)
-            elapsed = asyncio.get_event_loop().time() - start_time
-            timeout_remaining = self.timeout - elapsed
-
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=1)
-
-            if process.is_alive():
-                process.kill()
-                process.join()
-
-            return (
-                None,
-                "",
-                f"Timeout Error: Script execution exceeded {self.timeout} second(s)\n",
-            )
-
-        process.join()
-
-        if not result_queue.empty():
-            result, stdout, stderr = result_queue.get()
-            return result, stdout, stderr
-        else:
-            return None, "", "Error: Process terminated unexpectedly\n"
-
-    async def call(self, inputs, training=False):
+    async def call(self, inputs, training=False, sandbox=None):
         if not inputs:
             return None
         python_script = self.state.get("python_script")
-        result, stdout, stderr = await self.execute(inputs, python_script)
+        # Sandbox resolution order: per-call kwarg > constructor-supplied
+        # sandbox > fresh sandbox of `sandbox_type` (built inside
+        # `_run_script` when `sandbox` is still None).
+        if sandbox is None:
+            sandbox = self.sandbox
+        result, stdout, stderr = await self.execute(
+            inputs, python_script, sandbox=sandbox
+        )
         if training:
             predictions = self.state.get("current_predictions")
             if result:
@@ -386,7 +474,7 @@ class PythonSynthesis(Module):
                     name=self.name,
                 )
 
-    async def compute_output_spec(self, inputs, training=False):
+    async def compute_output_spec(self, inputs, training=False, sandbox=None):
         if self.return_python_script:
             return await ops.concat(
                 await ops.out_mask(
@@ -415,12 +503,47 @@ class PythonSynthesis(Module):
             "seed_scripts": self.seed_scripts,
             "default_return_value": self.default_return_value,
             "return_python_script": self.return_python_script,
+            "timeout": self.timeout,
+            "sandbox_type": get_registered_name(self.sandbox_type),
             "name": self.name,
             "description": self.description,
             "trainable": self.trainable,
         }
-        return config
+        sandbox_config = {
+            "sandbox": (
+                serialization_lib.serialize_synalinks_object(self.sandbox)
+                if self.sandbox is not None
+                else None
+            )
+        }
+        tools_config = {
+            "tools": [
+                serialization_lib.serialize_synalinks_object(tool)
+                for tool in self.tools.values()
+            ]
+        }
+        return {**config, **sandbox_config, **tools_config}
 
     @classmethod
     def from_config(cls, config):
-        return cls(**config)
+        tools = [
+            serialization_lib.deserialize_synalinks_object(tool)
+            for tool in config.pop("tools", [])
+        ]
+        sandbox = None
+        if "sandbox" in config:
+            sandbox_serialized = config.pop("sandbox")
+            if sandbox_serialized is not None:
+                sandbox = serialization_lib.deserialize_synalinks_object(
+                    sandbox_serialized
+                )
+        sandbox_type_name = config.pop("sandbox_type", None)
+        sandbox_type = (
+            get_registered_object(sandbox_type_name) if sandbox_type_name else None
+        )
+        return cls(
+            tools=tools or None,
+            sandbox=sandbox,
+            sandbox_type=sandbox_type,
+            **config,
+        )

@@ -35,6 +35,9 @@ wheels/
 
 # Django
 *.log
+# Keep guide/example run logs (committed as reproducibility proof, embedded in the docs)
+!guides/*.log
+!examples/*.log
 db.sqlite3
 db.sqlite3-journal
 local_settings.py
@@ -137,6 +140,16 @@ nosetests.xml
 *.mo
 *.pot
 
+# Claude Code
+.claude/
+.agents/
+
+# pytest-benchmark
+.benchmarks/
+
+# ruff
+.ruff_cache/
+
 # MLflow
 mlflow-data/
 mlruns/
@@ -145,5 +158,10 @@ mlflow.db
 # Claude skills
 synalinks-skills/
 
-# Reseach projects
-synalinks-research/
+research-blogs/
+AUTOBLOG.md
+
+# Marketing website (developed as a separate project, not part of the framework)
+synalinks-website/
+# Synalinks Gym (nested standalone repo, not part of the framework)
+synalinks-gym/

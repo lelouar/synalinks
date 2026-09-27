@@ -1,18 +1,50 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import json
+import os
+import tempfile
+import warnings
 from unittest.mock import patch
 
 from synalinks.src import testing
 from synalinks.src.backend import ChatMessage
 from synalinks.src.backend import ChatMessages
+from synalinks.src.backend import DataModel
+from synalinks.src.backend import Field
 from synalinks.src.backend import is_chat_messages
-from synalinks.src.language_models import LanguageModel
+from synalinks.src.backend.common.op_scope import op_scope
 from synalinks.src.modules.agents.function_calling_agent import FunctionCallingAgent
 from synalinks.src.modules.core.input_module import Input
 from synalinks.src.modules.core.tool import Tool
+from synalinks.src.modules.language_models import LanguageModel
+from synalinks.src.modules.language_models.language_model import StreamingIterator
 from synalinks.src.programs import Program
 from synalinks.src.saving.object_registration import register_synalinks_serializable
+
+
+def _lm_response(*, content=None, reasoning_content=None, tool_calls=None):
+    """Build a litellm-shaped response for the native function-calling path.
+
+    `tool_calls` is a list of `{"name": ..., "arguments": {...}}` (flat
+    synalinks shape); this helper wraps each into the OpenAI nested
+    `{id, type, function}` envelope and JSON-encodes the arguments.
+    """
+    message = {"content": content}
+    if reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
+    if tool_calls:
+        message["tool_calls"] = [
+            {
+                "id": f"call_{i}",
+                "type": "function",
+                "function": {
+                    "name": tc["name"],
+                    "arguments": json.dumps(tc["arguments"]),
+                },
+            }
+            for i, tc in enumerate(tool_calls)
+        ]
+    return {"choices": [{"message": message}]}
 
 
 @register_synalinks_serializable()
@@ -164,7 +196,7 @@ class FunctionCallingAgentTest(testing.TestCase):
 
     @patch("litellm.acompletion")
     async def test_autonomous_mode_simple_calculation(self, mock_completion):
-        """Test autonomous mode with a simple calculation."""
+        """Autonomous mode issues a native tool call, runs it, then finalizes."""
         language_model = LanguageModel(model="ollama/mistral")
         tools = [
             Tool(calculate),
@@ -183,35 +215,19 @@ class FunctionCallingAgentTest(testing.TestCase):
             name="autonomous_calculation_test",
         )
 
-        tool_calls = {
-            "thinking": (
-                "Perform simple arithmetic operation by adding the numbers "
-                "given in the input."
+        mock_completion.side_effect = [
+            # Iter 1: native tool call to `calculate`.
+            _lm_response(
+                content="Adding the two numbers.",
+                tool_calls=[
+                    {"name": "calculate", "arguments": {"expression": "152648 + 485"}}
+                ],
             ),
-            "tool_calls": [
-                {
-                    "tool_name": "calculate",
-                    "expression": "152648 + 485",
-                }
-            ],
-        }
-
-        tool_calls_1 = {
-            "thinking": (
-                "The user has asked for a simple arithmetic operation, "
-                "specifically adding 152648 and 485. I have already performed "
-                "the calculation using the 'calculate' tool and obtained the "
-                "result as 153133."
-            ),
-            "tool_calls": [],
-        }
-
-        mock_responses = [
-            {"choices": [{"message": {"content": json.dumps(tool_calls)}}]},
-            {"choices": [{"message": {"content": json.dumps(tool_calls_1)}}]},
+            # Iter 2: no tool calls -> loop breaks.
+            _lm_response(content="The calculation is done; the result is 153133."),
+            # final_generator turn.
+            _lm_response(content="152648 + 485 = 153133."),
         ]
-
-        mock_completion.side_effect = mock_responses
 
         input_messages = ChatMessages(
             messages=[
@@ -223,18 +239,23 @@ class FunctionCallingAgentTest(testing.TestCase):
         )
         result = await agent(input_messages)
 
-        print("Result:")
-        print(result.prettify_json())
-
-        # Verify result structure
         self.assertIsNotNone(result)
-        messages = result.get("messages", [])
-        self.assertGreater(len(messages), 0)
         self.assertTrue(is_chat_messages(result))
+        messages = result.get("messages", [])
+        roles = [m.get("role") for m in messages]
+        # The tool actually executed: an assistant tool-call followed by a
+        # tool-result message carrying `calculate`'s output (153133).
+        self.assertIn("assistant", roles)
+        self.assertIn("tool", roles)
+        tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        self.assertTrue(
+            any("153133" in json.dumps(m.get("content")) for m in tool_msgs),
+            f"calculate result not found in tool messages: {tool_msgs}",
+        )
 
     @patch("litellm.acompletion")
     async def test_autonomous_mode_complex_calculation(self, mock_completion):
-        """Test autonomous mode with a more complex calculation."""
+        """Autonomous mode runs a multi-step expression through `calculate`."""
         language_model = LanguageModel(model="ollama/mistral")
         tools = [
             Tool(calculate),
@@ -253,43 +274,20 @@ class FunctionCallingAgentTest(testing.TestCase):
             name="complex_calculation_test",
         )
 
-        tool_calls = {
-            "thinking": (
-                "First, I will perform the arithmetic operation as instructed. "
-                "Let's calculate (150 + 250) * 2 / 4. The order of operations "
-                "is follow BIDMAS/BODMAS which means Brackets, Orders or "
-                "Powers, Division and Multiplication, Addition and "
-                "Subtraction. So, first I will add 150 and 250, then multiply "
-                "the result by 2, divide it by 4 and finally add 100."
+        # (150 + 250) * 2 / 4 + 100 == 300
+        mock_completion.side_effect = [
+            _lm_response(
+                content="Evaluating the full expression in one shot.",
+                tool_calls=[
+                    {
+                        "name": "calculate",
+                        "arguments": {"expression": "(150 + 250) * 2 / 4 + 100"},
+                    }
+                ],
             ),
-            "tool_calls": [
-                {
-                    "tool_name": "calculate",
-                    "expression": "(150 + 250) * 2 / 4 + 100",
-                }
-            ],
-        }
-
-        tool_calls_1 = {
-            "thinking": (
-                "The user provided a mathematical expression to calculate. I "
-                "performed the operation (150 + 250) * 2 / 4 and then added "
-                "100 to the result. Now, the result is 300."
-            ),
-            "tool_calls": [
-                {
-                    "tool_name": "calculate",
-                    "expression": "(150 + 250) * 2 / 4 + 100",
-                }
-            ],
-        }
-
-        mock_responses = [
-            {"choices": [{"message": {"content": json.dumps(tool_calls)}}]},
-            {"choices": [{"message": {"content": json.dumps(tool_calls_1)}}]},
+            _lm_response(content="The expression evaluates to 300."),
+            _lm_response(content="The result is 300."),
         ]
-
-        mock_completion.side_effect = mock_responses
 
         input_messages = ChatMessages(
             messages=[
@@ -302,8 +300,16 @@ class FunctionCallingAgentTest(testing.TestCase):
             ]
         )
         result = await agent(input_messages)
-        print("Result:")
-        print(result.prettify_json())
+
+        self.assertIsNotNone(result)
+        self.assertTrue(is_chat_messages(result))
+        messages = result.get("messages", [])
+        self.assertIn("tool", [m.get("role") for m in messages])
+        tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        self.assertTrue(
+            any("300" in json.dumps(m.get("content")) for m in tool_msgs),
+            f"calculate result not found in tool messages: {tool_msgs}",
+        )
 
     @patch("litellm.acompletion")
     async def test_autonomous_mode_returns_chat_messages_without_schema(
@@ -327,27 +333,19 @@ class FunctionCallingAgentTest(testing.TestCase):
             name="autonomous_no_schema_test",
         )
 
-        tool_calls = {
-            "thinking": "I need to calculate 10 + 20.",
-            "tool_calls": [
-                {
-                    "tool_name": "calculate",
-                    "expression": "10 + 20",
-                }
-            ],
-        }
-
-        tool_calls_1 = {
-            "thinking": "The calculation is complete. The result is 30.",
-            "tool_calls": [],
-        }
-
-        mock_responses = [
-            {"choices": [{"message": {"content": json.dumps(tool_calls)}}]},
-            {"choices": [{"message": {"content": json.dumps(tool_calls_1)}}]},
+        mock_completion.side_effect = [
+            # Iter 1: native tool call.
+            _lm_response(
+                content="I need to calculate 10 + 20.",
+                tool_calls=[
+                    {"name": "calculate", "arguments": {"expression": "10 + 20"}}
+                ],
+            ),
+            # Iter 2: no tool calls → loop breaks.
+            _lm_response(content="The calculation is complete. The result is 30."),
+            # final_generator turn.
+            _lm_response(content="The result is 30."),
         ]
-
-        mock_completion.side_effect = mock_responses
 
         input_messages = ChatMessages(
             messages=[
@@ -374,6 +372,229 @@ class FunctionCallingAgentTest(testing.TestCase):
         self.assertIn("tool", roles)
 
     @patch("litellm.acompletion")
+    async def test_autonomous_mode_no_data_model_with_custom_input(self, mock_completion):
+        """Autonomous agent with data_model=None and a non-ChatMessages input.
+
+        Exercises the path where the final_generator has schema=None and the
+        resulting ChatMessage is appended to the trajectory.
+        """
+
+        class Query(DataModel):
+            query: str = Field(description="The user query")
+
+        language_model = LanguageModel(model="ollama/mistral")
+        tools = [Tool(calculate)]
+        inputs = Input(data_model=Query)
+        outputs = await FunctionCallingAgent(
+            language_model=language_model,
+            tools=tools,
+            autonomous=True,
+            max_iterations=3,
+        )(inputs)
+        agent = Program(
+            inputs=inputs,
+            outputs=outputs,
+            name="autonomous_no_schema_custom_input_test",
+        )
+
+        mock_completion.side_effect = [
+            # Iter 1: native tool call.
+            _lm_response(
+                content="I need to add 1 + 1.",
+                tool_calls=[{"name": "calculate", "arguments": {"expression": "1 + 1"}}],
+            ),
+            # Iter 2: no tool calls → loop breaks.
+            _lm_response(content="Result is 2."),
+            # final_generator: thinking populated from reasoning_content.
+            _lm_response(content="The answer is 2.", reasoning_content="1 + 1 equals 2."),
+        ]
+
+        result = await agent(Query(query="How much is 1 + 1?"))
+
+        self.assertIsNotNone(result)
+        self.assertTrue(is_chat_messages(result))
+        messages = result.get("messages", [])
+        # Final assistant message must come from the no-schema final_generator
+        # and carry the reasoning_content field populated from reasoning_content.
+        last = messages[-1]
+        self.assertEqual(last.get("role"), "assistant")
+        self.assertEqual(last.get("content"), "The answer is 2.")
+        self.assertEqual(last.get("reasoning_content"), "1 + 1 equals 2.")
+
+    @patch("litellm.acompletion")
+    async def test_autonomous_mode_no_data_model_with_chain_of_thought(
+        self, mock_completion
+    ):
+        """Autonomous agent with data_model=None and use_chain_of_thought=True.
+
+        Exercises the CoT-based tool_calls_generator and the no-schema
+        final_generator together.
+        """
+        language_model = LanguageModel(model="ollama/mistral")
+        tools = [Tool(calculate)]
+        inputs = Input(data_model=ChatMessages)
+        outputs = await FunctionCallingAgent(
+            language_model=language_model,
+            tools=tools,
+            autonomous=True,
+            max_iterations=3,
+            use_chain_of_thought=True,
+        )(inputs)
+        agent = Program(
+            inputs=inputs,
+            outputs=outputs,
+            name="autonomous_no_schema_cot_test",
+        )
+
+        tool_calls_done = {
+            "thinking": "Nothing to do.",
+            "tool_calls": [],
+        }
+        final_message = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "Done.",
+                        "reasoning_content": "No work needed.",
+                    }
+                }
+            ]
+        }
+
+        mock_completion.side_effect = [
+            {"choices": [{"message": {"content": json.dumps(tool_calls_done)}}]},
+            final_message,
+        ]
+
+        input_messages = ChatMessages(messages=[ChatMessage(role="user", content="hi")])
+        result = await agent(input_messages)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(is_chat_messages(result))
+        last = result.get("messages")[-1]
+        self.assertEqual(last.get("role"), "assistant")
+        self.assertEqual(last.get("content"), "Done.")
+        self.assertEqual(last.get("reasoning_content"), "No work needed.")
+
+    @patch("litellm.acompletion")
+    async def test_autonomous_mode_streaming_final_answer(self, mock_completion):
+        """With streaming=True and no data_model, the agent returns a
+        StreamingIterator from the final generator instead of a wrapped
+        trajectory."""
+        language_model = LanguageModel(model="ollama/mistral")
+        tools = [Tool(calculate)]
+        inputs = Input(data_model=ChatMessages)
+        outputs = await FunctionCallingAgent(
+            language_model=language_model,
+            tools=tools,
+            autonomous=True,
+            max_iterations=2,
+            streaming=True,
+        )(inputs)
+        agent = Program(
+            inputs=inputs,
+            outputs=outputs,
+            name="autonomous_streaming_test",
+        )
+
+        # Tool-calling step: no tools to call, agent moves to final answer.
+        no_more_tools = {"thinking": "done.", "tool_calls": []}
+        # Final generator streams its response.
+        stream_chunks = iter(
+            [
+                {"choices": [{"delta": {"content": "Hello "}}]},
+                {"choices": [{"delta": {"content": "world."}}]},
+            ]
+        )
+
+        mock_completion.side_effect = [
+            {"choices": [{"message": {"content": json.dumps(no_more_tools)}}]},
+            stream_chunks,
+        ]
+
+        input_messages = ChatMessages(
+            messages=[ChatMessage(role="user", content="say hi")]
+        )
+        stream = await agent(input_messages)
+
+        # The result must be the StreamingIterator itself, not a wrapped
+        # ChatMessages; the caller drains it.
+        collected = ""
+        async for chunk in stream:
+            collected += chunk.get("content", "")
+        self.assertEqual(collected, "Hello world.")
+
+    @patch("litellm.acompletion")
+    async def test_streaming_drained_to_chat_messages_in_batched_loop(
+        self, mock_completion
+    ):
+        """Inside a batched loop (op_scope("inference"), as predict/evaluate
+        run), a streaming agent drains its final answer into a concrete wrapped
+        ChatMessages so the prediction stays scorable, and records the
+        time-to-first-token latency onto the inference-phase counters."""
+        language_model = LanguageModel(model="ollama/mistral")
+        tools = [Tool(calculate)]
+        inputs = Input(data_model=ChatMessages)
+        outputs = await FunctionCallingAgent(
+            language_model=language_model,
+            tools=tools,
+            autonomous=True,
+            max_iterations=2,
+            streaming=True,
+        )(inputs)
+        agent = Program(
+            inputs=inputs,
+            outputs=outputs,
+            name="autonomous_streaming_batched_test",
+        )
+
+        no_more_tools = {"thinking": "done.", "tool_calls": []}
+        stream_chunks = iter(
+            [
+                {"choices": [{"delta": {"content": "Hello "}}]},
+                {"choices": [{"delta": {"content": "world."}}]},
+            ]
+        )
+        mock_completion.side_effect = [
+            {"choices": [{"message": {"content": json.dumps(no_more_tools)}}]},
+            stream_chunks,
+        ]
+
+        input_messages = ChatMessages(
+            messages=[ChatMessage(role="user", content="say hi")]
+        )
+        with op_scope("inference"):
+            result = await agent(input_messages)
+
+        # Concrete, scorable prediction, not a raw StreamingIterator.
+        self.assertNotIsInstance(result, StreamingIterator)
+        self.assertTrue(is_chat_messages(result))
+        # The drained final answer is appended to the trajectory.
+        contents = [m.get("content") for m in result.get_json()["messages"]]
+        self.assertIn("Hello world.", contents)
+        # Draining the stream recorded one inference-phase streamed call.
+        self.assertEqual(language_model.inference_cumulated_streaming_calls, 1)
+
+    @patch("litellm.acompletion")
+    async def test_streaming_disabled_when_schema_provided(self, _mock_completion):
+        """`streaming=True` alongside a structured `data_model` is silently
+        downgraded, since structured output needs the full response."""
+
+        class FinalAnswer(DataModel):
+            answer: str = Field(description="The final answer")
+
+        language_model = LanguageModel(model="ollama/mistral")
+        agent = FunctionCallingAgent(
+            language_model=language_model,
+            tools=[Tool(calculate)],
+            data_model=FinalAnswer,
+            streaming=True,
+            name="streaming_with_schema",
+        )
+        self.assertFalse(agent.streaming)
+        self.assertFalse(agent.final_generator.streaming)
+
+    @patch("litellm.acompletion")
     async def test_non_autonomous_mode_returns_chat_messages(self, mock_completion):
         """Test that non-autonomous mode returns ChatMessages."""
         language_model = LanguageModel(model="ollama/mistral")
@@ -393,21 +614,12 @@ class FunctionCallingAgentTest(testing.TestCase):
             name="non_autonomous_test",
         )
 
-        tool_calls = {
-            "thinking": "I need to calculate 5 * 5.",
-            "tool_calls": [
-                {
-                    "tool_name": "calculate",
-                    "expression": "5 * 5",
-                }
-            ],
-        }
-
-        mock_responses = [
-            {"choices": [{"message": {"content": json.dumps(tool_calls)}}]},
+        mock_completion.side_effect = [
+            _lm_response(
+                content="I need to calculate 5 * 5.",
+                tool_calls=[{"name": "calculate", "arguments": {"expression": "5 * 5"}}],
+            ),
         ]
-
-        mock_completion.side_effect = mock_responses
 
         input_messages = ChatMessages(
             messages=[
@@ -483,8 +695,11 @@ class FunctionCallingAgentTest(testing.TestCase):
                     tool_calls=[
                         {
                             "id": "test-tool-call-id",
-                            "name": "calculate",
-                            "arguments": {"expression": "5 * 5"},
+                            "type": "function",
+                            "function": {
+                                "name": "calculate",
+                                "arguments": {"expression": "5 * 5"},
+                            },
                         }
                     ],
                 ),
@@ -528,21 +743,12 @@ class FunctionCallingAgentTest(testing.TestCase):
             name="non_autonomous_trajectory_test",
         )
 
-        tool_calls = {
-            "thinking": "I need to calculate 3 + 3.",
-            "tool_calls": [
-                {
-                    "tool_name": "calculate",
-                    "expression": "3 + 3",
-                }
-            ],
-        }
-
-        mock_responses = [
-            {"choices": [{"message": {"content": json.dumps(tool_calls)}}]},
+        mock_completion.side_effect = [
+            _lm_response(
+                content="I need to calculate 3 + 3.",
+                tool_calls=[{"name": "calculate", "arguments": {"expression": "3 + 3"}}],
+            ),
         ]
-
-        mock_completion.side_effect = mock_responses
 
         input_messages = ChatMessages(
             messages=[
@@ -638,48 +844,29 @@ class FunctionCallingAgentTest(testing.TestCase):
             name="interactive_multi_step_test",
         )
 
-        # First step: calculate 100 + 200
-        tool_calls_step1 = {
-            "thinking": "First, I need to calculate 100 + 200.",
-            "tool_calls": [
-                {
-                    "tool_name": "calculate",
-                    "expression": "100 + 200",
-                }
-            ],
-        }
-
-        # Second step: multiply result by 3
-        tool_calls_step2 = {
-            "thinking": "Now I need to multiply 300 by 3.",
-            "tool_calls": [
-                {
-                    "tool_name": "calculate",
-                    "expression": "300 * 3",
-                }
-            ],
-        }
-
-        # Final step: no more tool calls
-        tool_calls_step3 = {
-            "thinking": "Calculation complete. 100 + 200 = 300, then 300 * 3 = 900.",
-            "tool_calls": [],
-        }
-
-        # Final generator response (ChatMessage format since no schema)
-        final_response = {
-            "role": "assistant",
-            "content": "The calculation is complete."
-            " 100 + 200 = 300, then 300 * 3 = 900.",
-        }
-
-        mock_responses = [
-            {"choices": [{"message": {"content": json.dumps(tool_calls_step1)}}]},
-            {"choices": [{"message": {"content": json.dumps(tool_calls_step2)}}]},
-            {"choices": [{"message": {"content": json.dumps(tool_calls_step3)}}]},
-            {"choices": [{"message": {"content": json.dumps(final_response)}}]},
+        mock_completion.side_effect = [
+            # Step 1: calculate 100 + 200
+            _lm_response(
+                content="First, I need to calculate 100 + 200.",
+                tool_calls=[
+                    {"name": "calculate", "arguments": {"expression": "100 + 200"}}
+                ],
+            ),
+            # Step 2: multiply result by 3
+            _lm_response(
+                content="Now I need to multiply 300 by 3.",
+                tool_calls=[
+                    {"name": "calculate", "arguments": {"expression": "300 * 3"}}
+                ],
+            ),
+            # Step 3: no more tool calls → loop terminates → final_generator.
+            _lm_response(content="Calculation complete."),
+            _lm_response(
+                content=(
+                    "The calculation is complete. 100 + 200 = 300, then 300 * 3 = 900."
+                )
+            ),
         ]
-        mock_completion.side_effect = mock_responses
 
         input_messages = ChatMessages(
             messages=[
@@ -716,3 +903,336 @@ class FunctionCallingAgentTest(testing.TestCase):
 
         # Verify we completed all steps
         self.assertEqual(step, 2)  # 0, 1, 2 = 3 steps
+
+    # The root AGENTS.md body is injected verbatim (no added framing), so the
+    # marker is a snippet of the file's own content.
+    _AGENTS_MD_MARKER = "Always be terse."
+
+    def _make_workdir_with_agents_md(self, body="# Conventions\nAlways be terse.\n"):
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(self._cleanup_tmpdir, tmpdir)
+        with open(os.path.join(tmpdir, "AGENTS.md"), "w", encoding="utf-8") as f:
+            f.write(body)
+        return tmpdir
+
+    def _cleanup_tmpdir(self, tmpdir):
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_agents_md_read_once_at_construction(self):
+        """The root AGENTS.md is read at construction into the
+        `custom_instructions` prompt variable, rendered by the agent prompt
+        template under a Codex-style header (never the trainable
+        instructions); nested AGENTS.md files are ignored."""
+        workdir = self._make_workdir_with_agents_md()
+        nested = os.path.join(workdir, "pkg")
+        os.makedirs(nested)
+        with open(os.path.join(nested, "AGENTS.md"), "w", encoding="utf-8") as f:
+            f.write("Nested rule that must NOT be injected.")
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            tools=[Tool(calculate)],
+            workdir=workdir,
+        )
+        self.assertIn("<custom_instructions>", agent.prompt_template)
+        self.assertIn(
+            "# AGENTS.md instructions from {{ item.directory }}",
+            agent.prompt_template,
+        )
+        items = agent.prompt_variables["custom_instructions"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["directory"], ".")
+        self.assertIn(self._AGENTS_MD_MARKER, items[0]["content"])
+        self.assertNotIn("Nested rule", items[0]["content"])
+        self.assertNotIn(self._AGENTS_MD_MARKER, agent.instructions)
+        self.assertNotIn(
+            self._AGENTS_MD_MARKER,
+            agent.tool_calls_generator.state.get("instructions"),
+        )
+
+        # Deleting the file after construction must not change the variable:
+        # it was read once and is not re-read on subsequent access.
+        os.remove(os.path.join(workdir, "AGENTS.md"))
+        self.assertIn(
+            self._AGENTS_MD_MARKER,
+            agent.prompt_variables["custom_instructions"][0]["content"],
+        )
+
+    async def test_no_workdir_means_no_custom_instructions_variable(self):
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            tools=[Tool(calculate)],
+        )
+        self.assertNotIn("custom_instructions", agent.prompt_variables)
+
+    @patch("litellm.acompletion")
+    async def test_agents_md_not_reinjected_across_interactive_steps(
+        self, mock_completion
+    ):
+        """Feeding a returned trajectory back in must not stack AGENTS.md copies."""
+        workdir = self._make_workdir_with_agents_md()
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            tools=[Tool(calculate)],
+            autonomous=False,
+            return_inputs_with_trajectory=True,
+            workdir=workdir,
+        )
+
+        # Two interactive turns: the first makes one LM call (a tool call,
+        # handed back to the caller), the second makes two (post-tool reply ->
+        # final). All three are scripted so no call falls into the (mocked)
+        # retry path. Auto-build traces on symbolic inputs, so it consumes none.
+        mock_completion.side_effect = [
+            _lm_response(
+                content="Calculating.",
+                tool_calls=[{"name": "calculate", "arguments": {"expression": "1 + 1"}}],
+            ),
+            _lm_response(content="No more tools."),
+            _lm_response(content="Done: 1 + 1 = 2."),
+        ]
+
+        input_messages = ChatMessages(
+            messages=[ChatMessage(role="user", content="What is 1 + 1?")]
+        )
+
+        # Two interactive turns, feeding the trajectory back into the agent.
+        result = await agent(input_messages)
+        result = await agent(result)
+        self.assertEqual(mock_completion.call_count, 3)
+
+        messages = result.get("messages", [])
+        agents_md_count = sum(
+            1
+            for m in messages
+            if isinstance(m.get("content"), str)
+            and self._AGENTS_MD_MARKER in m["content"]
+        )
+        self.assertEqual(agents_md_count, 0)
+        # The step generator's template carries the conventions instead,
+        # exactly once per call (never stacked).
+        per_call_counts = []
+        for call in mock_completion.call_args_list:
+            system = [
+                m for m in call.kwargs.get("messages", []) if m.get("role") == "system"
+            ]
+            joined = "".join(str(m.get("content")) for m in system)
+            per_call_counts.append(joined.count(self._AGENTS_MD_MARKER))
+        self.assertEqual(per_call_counts[0], 1)
+        self.assertLessEqual(max(per_call_counts), 1)
+
+    # -- skills ---------------------------------------------------------------
+
+    def _make_skills_root(self, name="pdf-filler", description="Fill PDF forms."):
+        """Create a skills *root* containing one ``<name>/SKILL.md`` skill."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(self._cleanup_tmpdir, root)
+        skill_dir = os.path.join(root, name)
+        os.makedirs(skill_dir)
+        with open(os.path.join(skill_dir, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write(
+                f"---\nname: {name}\ndescription: {description}\n---\n# {name}\nBody.\n"
+            )
+        return root
+
+    async def test_skills_discovered_once_at_construction(self):
+        """`skills` roots are discovered at construction into the
+        `available_skills` prompt variable, rendered by the agent prompt
+        template (not the trainable instructions, so in-context
+        optimization cannot drop the listing)."""
+        root = self._make_skills_root()
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            tools=[Tool(calculate)],
+            skills=[root],
+        )
+        self.assertIn("<available_skills>", agent.prompt_template)
+        self.assertIn("{{ skill.name }}", agent.prompt_template)
+        self.assertEqual(
+            agent.prompt_variables["available_skills"],
+            [{"name": "pdf-filler", "description": "Fill PDF forms."}],
+        )
+        self.assertNotIn("<available_skills>", agent.instructions)
+        self.assertNotIn(
+            "<available_skills>",
+            agent.tool_calls_generator.state.get("instructions"),
+        )
+
+    async def test_no_skills_means_no_skills_variable(self):
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            tools=[Tool(calculate)],
+        )
+        self.assertNotIn("available_skills", agent.prompt_variables)
+        self.assertEqual(agent.skills, [])
+
+    async def test_skills_path_must_exist(self):
+        with self.assertRaises(ValueError):
+            FunctionCallingAgent(
+                language_model=LanguageModel(model="ollama/mistral"),
+                tools=[Tool(calculate)],
+                skills=["/does/not/exist"],
+            )
+
+    @patch("litellm.acompletion")
+    async def test_skills_injected_and_not_reinjected(self, mock_completion):
+        """The available-skills block reaches every LM call's system prompt
+        via the template, and never lands in the trajectory (so feeding a
+        returned trajectory back in cannot stack copies)."""
+        root = self._make_skills_root()
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            tools=[Tool(calculate)],
+            autonomous=False,
+            return_inputs_with_trajectory=True,
+            skills=[root],
+        )
+
+        # Two interactive turns: the first makes one LM call (a tool call,
+        # handed back to the caller), the second makes two (post-tool reply ->
+        # final). All three are scripted so no call falls into the (mocked)
+        # retry path. Auto-build traces on symbolic inputs, so it consumes none.
+        mock_completion.side_effect = [
+            _lm_response(
+                content="Calculating.",
+                tool_calls=[{"name": "calculate", "arguments": {"expression": "1 + 1"}}],
+            ),
+            _lm_response(content="No more tools."),
+            _lm_response(content="Done."),
+        ]
+
+        input_messages = ChatMessages(
+            messages=[ChatMessage(role="user", content="What is 1 + 1?")]
+        )
+        result = await agent(input_messages)
+        result = await agent(result)
+        self.assertEqual(mock_completion.call_count, 3)
+
+        messages = result.get("messages", [])
+        skills_count = sum(
+            1
+            for m in messages
+            if isinstance(m.get("content"), str) and "<available_skills>" in m["content"]
+        )
+        self.assertEqual(skills_count, 0)
+        # The step generator's template carries the block (the final-answer
+        # generator keeps the default template), and it never stacks.
+        per_call_counts = []
+        for call in mock_completion.call_args_list:
+            system = [
+                m for m in call.kwargs.get("messages", []) if m.get("role") == "system"
+            ]
+            joined = "".join(str(m.get("content")) for m in system)
+            per_call_counts.append(joined.count("<available_skills>"))
+        self.assertEqual(per_call_counts[0], 1)
+        self.assertLessEqual(max(per_call_counts), 1)
+
+
+class SkillsToolWiringTest(testing.TestCase):
+    """The built-in `read_skill` tool added when Agent Skills are configured."""
+
+    def _make_skills_root(self):
+        root = tempfile.mkdtemp()
+        skill_dir = os.path.join(root, "pdf-processing")
+        os.makedirs(skill_dir)
+        with open(os.path.join(skill_dir, "SKILL.md"), "w") as f:
+            f.write(
+                "---\n"
+                "name: pdf-processing\n"
+                "description: Extract PDF text. Use when handling PDFs.\n"
+                "---\n"
+                "Use pdfplumber.\n"
+            )
+        return root
+
+    async def test_skills_add_builtin_read_skill_tool(self):
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            skills=[self._make_skills_root()],
+        )
+        self.assertIn("read_skill", agent.tools)
+        report = await agent.tools["read_skill"](name="pdf-processing")
+        self.assertIn("pdfplumber", report.get_json()["content"])
+
+    async def test_no_skills_no_read_skill_tool(self):
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            tools=[Tool(calculate)],
+        )
+        self.assertNotIn("read_skill", agent.tools)
+
+    async def test_user_read_skill_tool_wins_over_builtin(self):
+        async def read_skill(name: str):
+            """Custom reader.
+
+            Args:
+                name (str): The skill name.
+            """
+            return {"custom": True}
+
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            tools=[Tool(read_skill)],
+            skills=[self._make_skills_root()],
+        )
+        report = await agent.tools["read_skill"](name="x")
+        self.assertTrue(report.get_json()["custom"])
+
+    async def test_skill_tool_alone_satisfies_the_tools_requirement(self):
+        # With skills set, the built-in reader counts as a tool, so an agent
+        # may be constructed without any user tools.
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            skills=[self._make_skills_root()],
+        )
+        self.assertEqual(list(agent.tools), ["read_skill"])
+
+    async def test_skills_listing_has_no_location(self):
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            skills=[self._make_skills_root()],
+        )
+        skills = agent.prompt_variables["available_skills"]
+        self.assertEqual([s["name"] for s in skills], ["pdf-processing"])
+        self.assertEqual(sorted(skills[0]), ["description", "name"])
+        self.assertNotIn("<location>", agent.prompt_template)
+
+    async def test_skill_tool_survives_serialization_roundtrip(self):
+        root = self._make_skills_root()
+        agent = FunctionCallingAgent(
+            language_model=LanguageModel(model="ollama/mistral"),
+            skills=[root],
+        )
+        config = agent.get_config()
+        # Built-ins are not serialized with the user tools...
+        self.assertEqual(config["tools"], [])
+        # ...but rebuild from the `skills` config on reload.
+        reloaded = FunctionCallingAgent.from_config(config)
+        self.assertIn("read_skill", reloaded.tools)
+
+
+class TruncatedGenerationTest(testing.TestCase):
+    @patch("litellm.acompletion")
+    async def test_length_cut_stops_without_burning_retries(self, mock_completion):
+        language_model = LanguageModel(model="ollama/mistral", retry=3)
+        inputs = Input(data_model=ChatMessages)
+        outputs = await FunctionCallingAgent(
+            language_model=language_model,
+            tools=[Tool(calculate)],
+            autonomous=True,
+            max_iterations=3,
+        )(inputs)
+        agent = Program(inputs=inputs, outputs=outputs, name="truncated_test")
+
+        mock_completion.side_effect = [
+            {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+            _lm_response(content="final"),
+        ]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            await agent(ChatMessages(messages=[ChatMessage(role="user", content="hi")]))
+
+        # One turn (not retried three times), then the final generator.
+        self.assertEqual(mock_completion.call_count, 2)

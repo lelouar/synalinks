@@ -1,4 +1,4 @@
-# Hook API
+# Hooks API
 
 A hook is an object that can perform various actions at the begining/end of a module's call.
 
@@ -7,3 +7,4 @@ A hook is an object that can perform various actions at the begining/end of a mo
 - [Base Hook class](Base Hook class.md)
 - [Logger hook](Logger.md)
 - [Monitor hook](Monitor.md)
+- [Recorder hook](Recorder.md)

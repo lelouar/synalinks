@@ -1,4 +1,4 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from typing import List
 from typing import Literal
@@ -7,10 +7,17 @@ from typing import Union
 from synalinks.src import testing
 from synalinks.src.backend import DataModel
 from synalinks.src.backend import concatenate_json
-from synalinks.src.backend import decompose_json
 from synalinks.src.backend import factorize_json
 from synalinks.src.backend import in_mask_json
 from synalinks.src.backend import out_mask_json
+from synalinks.src.backend.common.json_utils import _py_concatenate_json
+from synalinks.src.backend.common.json_utils import _py_factorize_json
+from synalinks.src.backend.common.json_utils import _py_in_mask_json
+from synalinks.src.backend.common.json_utils import _py_out_mask_json
+from synalinks.src.backend.common.json_utils import _py_prefix_json
+from synalinks.src.backend.common.json_utils import _py_suffix_json
+from synalinks.src.backend.common.json_utils import prefix_json
+from synalinks.src.backend.common.json_utils import suffix_json
 
 
 class JsonConcatenateTest(testing.TestCase):
@@ -661,7 +668,25 @@ class JsonInMaskTest(testing.TestCase):
         result = in_mask_json(json, mask=["foo", "bar"])
         self.assertEqual(result, expected)
 
-    def test_mask_in_array(self):
+    def test_mask_in_array_drops_unmatched_array(self):
+        # An array whose key is not in the mask is dropped, just like an
+        # unmatched object. (Force-keeping arrays made the value masker
+        # disagree with the schema masker.)
+        json = {
+            "items": [
+                {"foo": "test", "bar": "test"},
+                {"foo_1": "test", "bar_1": "test"},
+            ]
+        }
+
+        expected = {}
+
+        result = in_mask_json(json, mask=["foo"])
+        self.assertEqual(result, expected)
+
+    def test_mask_in_array_keeps_matched_array_and_masks_items(self):
+        # When the array key matches the mask, the array is kept and its
+        # items are masked recursively.
         json = {
             "items": [
                 {"foo": "test", "bar": "test"},
@@ -671,7 +696,7 @@ class JsonInMaskTest(testing.TestCase):
 
         expected = {"items": [{"foo": "test"}, {"foo_1": "test"}]}
 
-        result = in_mask_json(json, mask=["foo"])
+        result = in_mask_json(json, mask=["item", "foo"])
         self.assertEqual(result, expected)
 
     def test_mask_empty_json(self):
@@ -743,90 +768,79 @@ class JsonInMaskTest(testing.TestCase):
         self.assertEqual(result, expected)
 
 
-class JsonDecomposeTest(testing.TestCase):
-    def test_decompose_json_with_list_property(self):
-        class Input(DataModel):
-            foos: List[str]
+class JsonPrefixSuffixTest(testing.TestCase):
+    def test_prefix_json(self):
+        result = prefix_json({"a": 1, "b": 2}, prefix="x")
+        self.assertEqual(result, {"x_a": 1, "x_b": 2})
 
-        class Result(DataModel):
-            foo: str
-            foo_1: str
+    def test_suffix_json(self):
+        result = suffix_json({"a": 1, "b": 2}, suffix="y")
+        self.assertEqual(result, {"a_y": 1, "b_y": 2})
 
-        json = Input(foos=["test1", "test2"]).get_json()
-        expected = Result(foo="test1", foo_1="test2").get_json()
+    def test_prefix_does_not_mutate_input(self):
+        original = {"a": 1}
+        prefix_json(original, "x")
+        self.assertEqual(original, {"a": 1})
 
-        result = decompose_json(json)
-        self.assertEqual(result, expected)
 
-    def test_decompose_json_with_three_items(self):
-        class Input(DataModel):
-            foos: List[str]
+# The "_py_*" tests explicitly exercise the Python fallback path, even when
+# the Rust `synaops` extension is installed.
+class PyJsonHelpersTest(testing.TestCase):
+    def test_py_prefix_json(self):
+        self.assertEqual(_py_prefix_json({"a": 1}, "x"), {"x_a": 1})
 
-        json = Input(foos=["a", "b", "c"]).get_json()
-        expected = {"foo": "a", "foo_1": "b", "foo_2": "c"}
+    def test_py_suffix_json(self):
+        self.assertEqual(_py_suffix_json({"a": 1}, "y"), {"a_y": 1})
 
-        result = decompose_json(json)
-        self.assertEqual(result, expected)
+    def test_py_concatenate_collision_renames(self):
+        json = {"a": 1}
+        result = _py_concatenate_json(json, json)
+        self.assertEqual(result, {"a": 1, "a_1": 1})
 
-    def test_decompose_json_with_non_list_property(self):
-        class Input(DataModel):
-            foo: str
-            bar: str
+    def test_py_concatenate_disjoint(self):
+        self.assertEqual(_py_concatenate_json({"a": 1}, {"b": 2}), {"a": 1, "b": 2})
 
-        json = Input(foo="test", bar="test").get_json()
-        expected = Input(foo="test", bar="test").get_json()
+    def test_py_factorize_groups_scalars(self):
+        result = _py_factorize_json({"foo": "x", "foo_1": "y"})
+        self.assertEqual(result, {"foos": ["x", "y"]})
 
-        result = decompose_json(json)
-        self.assertEqual(result, expected)
+    def test_py_factorize_extends_existing_array(self):
+        result = _py_factorize_json({"foos": ["a"], "foo": "b"})
+        self.assertEqual(result, {"foos": ["a", "b"]})
 
-    def test_decompose_json_with_mixed_properties(self):
-        class Input(DataModel):
-            foos: List[str]
-            bar: str
+    def test_py_factorize_keeps_unrelated_keys(self):
+        result = _py_factorize_json({"foo": "x", "foo_1": "y", "bar": "z"})
+        self.assertEqual(result, {"foos": ["x", "y"], "bar": "z"})
 
-        json = Input(foos=["a", "b"], bar="c").get_json()
-        expected = {"foo": "a", "foo_1": "b", "bar": "c"}
+    def test_py_factorize_no_grouping_returns_singular(self):
+        result = _py_factorize_json({"single": "v"})
+        self.assertEqual(result, {"single": "v"})
 
-        result = decompose_json(json)
-        self.assertEqual(result, expected)
+    def test_py_out_mask_no_args_returns_input(self):
+        self.assertEqual(_py_out_mask_json({"a": 1}), {"a": 1})
 
-    def test_decompose_json_with_multiple_list_properties(self):
-        class Input(DataModel):
-            foos: List[str]
-            bars: List[str]
+    def test_py_in_mask_no_args_returns_empty(self):
+        self.assertEqual(_py_in_mask_json({"a": 1}), {})
 
-        json = Input(
-            foos=["a", "b"],
-            bars=["c", "d"],
-        ).get_json()
+    def test_py_out_mask_with_pattern_recursive(self):
+        result = _py_out_mask_json(
+            {"foo": 1, "nested": {"foo": 2, "bar": 3}}, mask=["foo"]
+        )
+        self.assertEqual(result, {"nested": {"bar": 3}})
 
-        expected = {
-            "foo": "a",
-            "foo_1": "b",
-            "bar": "c",
-            "bar_1": "d",
-        }
+    def test_py_out_mask_descends_into_arrays(self):
+        result = _py_out_mask_json(
+            {"items": [{"foo": 1, "bar": 2}, {"foo": 3, "bar": 4}]},
+            mask=["foo"],
+        )
+        self.assertEqual(result, {"items": [{"bar": 2}, {"bar": 4}]})
 
-        result = decompose_json(json)
-        self.assertEqual(result, expected)
+    def test_py_in_mask_pattern_match(self):
+        result = _py_in_mask_json({"input_a": 1, "output_b": 2}, pattern="^input_")
+        self.assertEqual(result, {"input_a": 1})
 
-    def test_decompose_json_single_item_list(self):
-        class Input(DataModel):
-            foos: List[str]
-
-        json = Input(foos=["only"]).get_json()
-        expected = {"foo": "only"}
-
-        result = decompose_json(json)
-        self.assertEqual(result, expected)
-
-    def test_decompose_is_inverse_of_factorize(self):
-        class Input(DataModel):
-            foo: str
-            foo_1: str
-            bar: str
-
-        json = Input(foo="a", foo_1="b", bar="c").get_json()
-        factorized = factorize_json(json)
-        result = decompose_json(factorized)
-        self.assertEqual(result, json)
+    def test_py_in_mask_non_recursive_drops_arrays(self):
+        result = _py_in_mask_json(
+            {"foo": 1, "nested": {"foo": 2}}, mask=["foo"], recursive=False
+        )
+        self.assertEqual(result, {"foo": 1})

@@ -10,11 +10,11 @@ for merging and manipulating data models.
 ```mermaid
 graph LR
     subgraph Operators
-        CONCAT[A + B: Concatenate]
-        AND[A & B: Safe Merge]
-        OR[A | B: First Non-None]
-        XOR[A ^ B: Exclusive]
-        NOT[~A: Cancel]
+        CONCAT["A + B: Concatenate"]
+        AND["A & B: Safe Merge"]
+        OR["A | B: First Non-None"]
+        XOR["A ^ B: Exclusive"]
+        NOT["~A: Cancel"]
     end
 ```
 
@@ -111,7 +111,7 @@ class Answer(synalinks.DataModel):
 
 async def main():
     load_dotenv()
-    language_model = synalinks.LanguageModel(model="gemini/gemini-2.0-flash")
+    language_model = synalinks.LanguageModel(model="ollama/mistral:latest")
 
     inputs = synalinks.Input(data_model=Query)
 
@@ -210,13 +210,13 @@ async def main():
     load_dotenv()
 
     # Enable observability for tracing (view traces at http://localhost:5000)
-    synalinks.enable_observability(
-        tracking_uri="http://localhost:5000",
-        experiment_name="lesson_5a_data_model_operators",
-    )
+#     synalinks.enable_observability(
+#         tracking_uri="http://localhost:5000",
+#         experiment_name="lesson_5a_data_model_operators",
+#     )
 
     language_model = synalinks.LanguageModel(
-        model="gemini/gemini-2.0-flash",
+        model="ollama/mistral:latest",
     )
 
     # =========================================================================

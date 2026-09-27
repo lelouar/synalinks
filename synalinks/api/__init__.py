@@ -8,9 +8,11 @@ from synalinks.api import backend as backend
 from synalinks.api import callbacks as callbacks
 from synalinks.api import config as config
 from synalinks.api import datasets as datasets
+from synalinks.api import decision_models as decision_models
 from synalinks.api import embedding_models as embedding_models
 from synalinks.api import hooks as hooks
 from synalinks.api import initializers as initializers
+from synalinks.api import knowledge_bases as knowledge_bases
 from synalinks.api import language_models as language_models
 from synalinks.api import metrics as metrics
 from synalinks.api import modules as modules
@@ -18,8 +20,10 @@ from synalinks.api import ops as ops
 from synalinks.api import optimizers as optimizers
 from synalinks.api import programs as programs
 from synalinks.api import rewards as rewards
+from synalinks.api import sandboxes as sandboxes
 from synalinks.api import saving as saving
 from synalinks.api import tree as tree
+from synalinks.api import tuners as tuners
 from synalinks.api import utils as utils
 from synalinks.src.backend import DataModel as DataModel
 from synalinks.src.backend import name_scope as name_scope
@@ -31,20 +35,38 @@ from synalinks.src.backend.common.symbolic_data_model import (
 )
 from synalinks.src.backend.common.symbolic_scope import SymbolicScope as SymbolicScope
 from synalinks.src.backend.config import api_base as api_base
-from synalinks.src.backend.config import disable_telemetry as disable_telemetry
+from synalinks.src.backend.config import default_decision_model as default_decision_model
+from synalinks.src.backend.config import (
+    default_embedding_model as default_embedding_model,
+)
+from synalinks.src.backend.config import default_knowledge_base as default_knowledge_base
+from synalinks.src.backend.config import default_language_model as default_language_model
 from synalinks.src.backend.config import enable_logging as enable_logging
 from synalinks.src.backend.config import enable_observability as enable_observability
 from synalinks.src.backend.config import get_seed as get_seed
 from synalinks.src.backend.config import (
     is_observability_enabled as is_observability_enabled,
 )
-from synalinks.src.backend.config import is_telemetry_enabled as is_telemetry_enabled
+from synalinks.src.backend.config import (
+    is_trace_recording_enabled as is_trace_recording_enabled,
+)
+from synalinks.src.backend.config import record_traces as record_traces
 from synalinks.src.backend.config import set_api_base as set_api_base
+from synalinks.src.backend.config import (
+    set_default_decision_model as set_default_decision_model,
+)
+from synalinks.src.backend.config import (
+    set_default_embedding_model as set_default_embedding_model,
+)
+from synalinks.src.backend.config import (
+    set_default_knowledge_base as set_default_knowledge_base,
+)
+from synalinks.src.backend.config import (
+    set_default_language_model as set_default_language_model,
+)
 from synalinks.src.backend.config import set_seed as set_seed
 from synalinks.src.backend.config import synalinks_home as synalinks_home
-from synalinks.src.backend.pydantic.base import ChatMessage as ChatMessage
-from synalinks.src.backend.pydantic.base import ChatMessages as ChatMessages
-from synalinks.src.backend.pydantic.base import ChatRole as ChatRole
+from synalinks.src.backend.pydantic.base import EmbeddingRequest as EmbeddingRequest
 from synalinks.src.backend.pydantic.base import Embeddings as Embeddings
 from synalinks.src.backend.pydantic.base import GenericInputs as GenericInputs
 from synalinks.src.backend.pydantic.base import GenericIO as GenericIO
@@ -52,37 +74,172 @@ from synalinks.src.backend.pydantic.base import GenericOutputs as GenericOutputs
 from synalinks.src.backend.pydantic.base import GenericResult as GenericResult
 from synalinks.src.backend.pydantic.base import Instructions as Instructions
 from synalinks.src.backend.pydantic.base import Prediction as Prediction
-from synalinks.src.backend.pydantic.base import Score as Score
-from synalinks.src.backend.pydantic.base import SimilaritySearch as SimilaritySearch
 from synalinks.src.backend.pydantic.base import Stamp as Stamp
-from synalinks.src.backend.pydantic.base import ToolCall as ToolCall
-from synalinks.src.backend.pydantic.base import ToolCall as ToolCalling
 from synalinks.src.backend.pydantic.base import Trainable as Trainable
-from synalinks.src.backend.pydantic.base import TripletSearch as TripletSearch
-from synalinks.src.backend.pydantic.base import is_chat_message as is_chat_message
-from synalinks.src.backend.pydantic.base import is_chat_messages as is_chat_messages
 from synalinks.src.backend.pydantic.base import is_embedded as is_embedded
 from synalinks.src.backend.pydantic.base import is_embedding as is_embedding
 from synalinks.src.backend.pydantic.base import is_embeddings as is_embeddings
 from synalinks.src.backend.pydantic.base import is_instructions as is_instructions
 from synalinks.src.backend.pydantic.base import is_prediction as is_prediction
-from synalinks.src.backend.pydantic.base import (
-    is_similarity_search as is_similarity_search,
-)
 from synalinks.src.backend.pydantic.base import is_stamped as is_stamped
-from synalinks.src.backend.pydantic.base import is_tool_call as is_tool_call
 from synalinks.src.backend.pydantic.base import is_trainable as is_trainable
-from synalinks.src.backend.pydantic.base import is_triplet_search as is_triplet_search
-from synalinks.src.embedding_models.embedding_model import (
-    EmbeddingModel as EmbeddingModel,
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionChoice as ChatCompletionChoice,
 )
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionCompletionTokensDetails as ChatCompletionCompletionTokensDetails,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionFunctionCall as ChatCompletionFunctionCall,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionJsonSchema as ChatCompletionJsonSchema,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionMessage as ChatCompletionMessage,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionPromptTokensDetails as ChatCompletionPromptTokensDetails,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionRequest as ChatCompletionRequest,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionResponse as ChatCompletionResponse,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionResponseFormat as ChatCompletionResponseFormat,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionTool as ChatCompletionTool,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionToolCall as ChatCompletionToolCall,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionToolFunction as ChatCompletionToolFunction,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    ChatCompletionUsage as ChatCompletionUsage,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    from_chat_completion_message as from_chat_completion_message,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    from_chat_completion_messages as from_chat_completion_messages,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    to_chat_completion_message as to_chat_completion_message,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    to_chat_completion_messages as to_chat_completion_messages,
+)
+from synalinks.src.backend.pydantic.chat_completions import (
+    to_chat_completion_request as to_chat_completion_request,
+)
+from synalinks.src.backend.pydantic.common import ChatMessage as ChatMessage
+from synalinks.src.backend.pydantic.common import ChatMessages as ChatMessages
+from synalinks.src.backend.pydantic.common import ChatRole as ChatRole
+from synalinks.src.backend.pydantic.common import ToolCall as ToolCall
+from synalinks.src.backend.pydantic.common import ToolCall as ToolCalling
+from synalinks.src.backend.pydantic.common import ToolCallFunction as ToolCallFunction
+from synalinks.src.backend.pydantic.common import is_chat_message as is_chat_message
+from synalinks.src.backend.pydantic.common import is_chat_messages as is_chat_messages
+from synalinks.src.backend.pydantic.common import (
+    is_strictly_chat_message as is_strictly_chat_message,
+)
+from synalinks.src.backend.pydantic.common import (
+    is_strictly_chat_messages as is_strictly_chat_messages,
+)
+from synalinks.src.backend.pydantic.common import is_tool_call as is_tool_call
+from synalinks.src.backend.pydantic.knowledge import EmbeddedEntity as EmbeddedEntity
+from synalinks.src.backend.pydantic.knowledge import Entities as Entities
+from synalinks.src.backend.pydantic.knowledge import Entity as Entity
+from synalinks.src.backend.pydantic.knowledge import KnowledgeGraph as KnowledgeGraph
+from synalinks.src.backend.pydantic.knowledge import KnowledgeGraphs as KnowledgeGraphs
+from synalinks.src.backend.pydantic.knowledge import Relation as Relation
+from synalinks.src.backend.pydantic.knowledge import Relations as Relations
+from synalinks.src.backend.pydantic.knowledge import (
+    is_embedded_entity as is_embedded_entity,
+)
+from synalinks.src.backend.pydantic.knowledge import is_entities as is_entities
+from synalinks.src.backend.pydantic.knowledge import is_entity as is_entity
+from synalinks.src.backend.pydantic.knowledge import (
+    is_knowledge_graph as is_knowledge_graph,
+)
+from synalinks.src.backend.pydantic.knowledge import (
+    is_knowledge_graphs as is_knowledge_graphs,
+)
+from synalinks.src.backend.pydantic.knowledge import is_relation as is_relation
+from synalinks.src.backend.pydantic.knowledge import is_relations as is_relations
+from synalinks.src.backend.pydantic.media import Audio as Audio
+from synalinks.src.backend.pydantic.media import Image as Image
+from synalinks.src.backend.pydantic.metrics import FineScore as FineScore
+from synalinks.src.backend.pydantic.metrics import Rating as Rating
+from synalinks.src.backend.pydantic.metrics import Rating10 as Rating10
+from synalinks.src.backend.pydantic.metrics import Rating20 as Rating20
+from synalinks.src.backend.pydantic.metrics import Score as Score
+from synalinks.src.datasets.csv_dataset import CSVDataset as CSVDataset
+from synalinks.src.datasets.dataset import Dataset as Dataset
+from synalinks.src.datasets.huggingface_dataset import (
+    HuggingFaceDataset as HuggingFaceDataset,
+)
+from synalinks.src.datasets.image_folder_dataset import (
+    ImageFolderDataset as ImageFolderDataset,
+)
+from synalinks.src.datasets.json_dataset import JSONDataset as JSONDataset
+from synalinks.src.datasets.json_dataset import JSONLDataset as JSONLDataset
+from synalinks.src.datasets.markdown_dataset import MarkdownDataset as MarkdownDataset
+from synalinks.src.datasets.markdown_dataset import MarkdownDocument as MarkdownDocument
+from synalinks.src.datasets.markdown_dataset import MarkdownSection as MarkdownSection
+from synalinks.src.datasets.markdown_dataset import (
+    parse_markdown_sections as parse_markdown_sections,
+)
+from synalinks.src.datasets.mlflow_dataset import MLflowDataset as MLflowDataset
+from synalinks.src.datasets.parquet_dataset import ParquetDataset as ParquetDataset
+from synalinks.src.datasets.text_dataset import TextDataset as TextDataset
+from synalinks.src.datasets.text_dataset import TextDocument as TextDocument
+from synalinks.src.hooks.monitor import trace_context as trace_context
 from synalinks.src.initializers.initializer import Initializer as Initializer
 from synalinks.src.knowledge_bases.knowledge_base import KnowledgeBase as KnowledgeBase
-from synalinks.src.language_models.language_model import LanguageModel as LanguageModel
+from synalinks.src.metrics.agents_metrics import GapK as GapK
+from synalinks.src.metrics.agents_metrics import PassAtK as PassAtK
+from synalinks.src.metrics.agents_metrics import PassHatK as PassHatK
+from synalinks.src.metrics.batch_metric import BatchMetric as BatchMetric
+from synalinks.src.metrics.em_metrics import (
+    EmbeddingModelOperationalMetric as EmbeddingModelOperationalMetric,
+)
+from synalinks.src.metrics.em_metrics import (
+    EmbeddingModelOptimizersOperationalMetric as EmbeddingModelOptimizersOperationalMetric,
+)
+from synalinks.src.metrics.em_metrics import (
+    EmbeddingModelRewardsOperationalMetric as EmbeddingModelRewardsOperationalMetric,
+)
+from synalinks.src.metrics.lm_metrics import LMOperationalMetric as LMOperationalMetric
+from synalinks.src.metrics.lm_metrics import (
+    LMOptimizersOperationalMetric as LMOptimizersOperationalMetric,
+)
+from synalinks.src.metrics.lm_metrics import (
+    LMRewardsOperationalMetric as LMRewardsOperationalMetric,
+)
 from synalinks.src.metrics.metric import Metric as Metric
+from synalinks.src.metrics.program_metrics import (
+    ProgramOperationalMetric as ProgramOperationalMetric,
+)
+from synalinks.src.modules.agents.cypher_agent import CypherAgent as CypherAgent
+from synalinks.src.modules.agents.deep_agent import DeepAgent as DeepAgent
 from synalinks.src.modules.agents.function_calling_agent import (
     FunctionCallingAgent as FunctionCallingAgent,
 )
+from synalinks.src.modules.agents.function_calling_agent import (
+    default_agent_prompt_template as default_agent_prompt_template,
+)
+from synalinks.src.modules.agents.rlm_agent import RecursiveLanguageModelAgent as RLM
+from synalinks.src.modules.agents.rlm_agent import (
+    RecursiveLanguageModelAgent as RecursiveLanguageModelAgent,
+)
+from synalinks.src.modules.agents.sql_agent import SQLAgent as SQLAgent
+from synalinks.src.modules.agents.vector_rag_agent import VectorRAGAgent as VectorRAGAgent
 from synalinks.src.modules.core.action import Action as Action
 from synalinks.src.modules.core.branch import Branch as Branch
 from synalinks.src.modules.core.decision import Decision as Decision
@@ -91,9 +248,19 @@ from synalinks.src.modules.core.generator import (
     default_prompt_template as default_prompt_template,
 )
 from synalinks.src.modules.core.identity import Identity as Identity
+from synalinks.src.modules.core.input_module import AudioInput as AudioInput
+from synalinks.src.modules.core.input_module import ImageInput as ImageInput
 from synalinks.src.modules.core.input_module import Input as Input
+from synalinks.src.modules.core.lambda_module import Lambda as Lambda
+from synalinks.src.modules.core.multi_decision import MultiDecision as MultiDecision
 from synalinks.src.modules.core.not_module import Not as Not
 from synalinks.src.modules.core.tool import Tool as Tool
+from synalinks.src.modules.decision_models.decision_model import (
+    DecisionModel as DecisionModel,
+)
+from synalinks.src.modules.embedding_models.embedding_model import (
+    EmbeddingModel as EmbeddingModel,
+)
 from synalinks.src.modules.knowledge.embed_knowledge import (
     EmbedKnowledge as EmbedKnowledge,
 )
@@ -103,8 +270,13 @@ from synalinks.src.modules.knowledge.retrieve_knowledge import (
 from synalinks.src.modules.knowledge.stamp_knowledge import (
     StampKnowledge as StampKnowledge,
 )
+from synalinks.src.modules.knowledge.text2cypher import Text2Cypher as Text2Cypher
+from synalinks.src.modules.knowledge.text2sql import Text2SQL as Text2SQL
 from synalinks.src.modules.knowledge.update_knowledge import (
     UpdateKnowledge as UpdateKnowledge,
+)
+from synalinks.src.modules.language_models.language_model import (
+    LanguageModel as LanguageModel,
 )
 from synalinks.src.modules.masking.in_mask import InMask as InMask
 from synalinks.src.modules.masking.out_mask import OutMask as OutMask
@@ -114,6 +286,74 @@ from synalinks.src.modules.merging.logical_and import And as And
 from synalinks.src.modules.merging.logical_or import Or as Or
 from synalinks.src.modules.merging.logical_xor import Xor as Xor
 from synalinks.src.modules.module import Module as Module
+from synalinks.src.modules.rerankers.rrf_reranker import RRFReranker as RRFReranker
+from synalinks.src.modules.retrievers.entity_fulltext_search import (
+    EntityFullTextSearch as EntityFullTextSearch,
+)
+from synalinks.src.modules.retrievers.entity_hybrid_fts_search import (
+    EntityHybridFTSSearch as EntityHybridFTSSearch,
+)
+from synalinks.src.modules.retrievers.entity_hybrid_regex_search import (
+    EntityHybridRegexSearch as EntityHybridRegexSearch,
+)
+from synalinks.src.modules.retrievers.entity_regex_search import (
+    EntityRegexSearch as EntityRegexSearch,
+)
+from synalinks.src.modules.retrievers.entity_similarity_search import (
+    EntitySimilaritySearch as EntitySimilaritySearch,
+)
+from synalinks.src.modules.retrievers.fulltext_search import (
+    FullTextSearch as FullTextSearch,
+)
+from synalinks.src.modules.retrievers.global_graph_map_reduce import (
+    GlobalGraphMapReduce as GlobalGraphMapReduce,
+)
+from synalinks.src.modules.retrievers.global_graph_search import (
+    GlobalGraphSearch as GlobalGraphSearch,
+)
+from synalinks.src.modules.retrievers.hybrid_fts_search import (
+    HybridFTSSearch as HybridFTSSearch,
+)
+from synalinks.src.modules.retrievers.hybrid_regex_search import (
+    HybridRegexSearch as HybridRegexSearch,
+)
+from synalinks.src.modules.retrievers.local_graph_search import (
+    LocalGraphSearch as LocalGraphSearch,
+)
+from synalinks.src.modules.retrievers.path_fulltext_search import (
+    PathFullTextSearch as PathFullTextSearch,
+)
+from synalinks.src.modules.retrievers.path_hybrid_fts_search import (
+    PathHybridFTSSearch as PathHybridFTSSearch,
+)
+from synalinks.src.modules.retrievers.path_hybrid_regex_search import (
+    PathHybridRegexSearch as PathHybridRegexSearch,
+)
+from synalinks.src.modules.retrievers.path_regex_search import (
+    PathRegexSearch as PathRegexSearch,
+)
+from synalinks.src.modules.retrievers.path_similarity_search import (
+    PathSimilaritySearch as PathSimilaritySearch,
+)
+from synalinks.src.modules.retrievers.regex_search import RegexSearch as RegexSearch
+from synalinks.src.modules.retrievers.relation_fulltext_search import (
+    RelationFullTextSearch as RelationFullTextSearch,
+)
+from synalinks.src.modules.retrievers.relation_hybrid_fts_search import (
+    RelationHybridFTSSearch as RelationHybridFTSSearch,
+)
+from synalinks.src.modules.retrievers.relation_hybrid_regex_search import (
+    RelationHybridRegexSearch as RelationHybridRegexSearch,
+)
+from synalinks.src.modules.retrievers.relation_regex_search import (
+    RelationRegexSearch as RelationRegexSearch,
+)
+from synalinks.src.modules.retrievers.relation_similarity_search import (
+    RelationSimilaritySearch as RelationSimilaritySearch,
+)
+from synalinks.src.modules.retrievers.similarity_search import (
+    SimilaritySearch as SimilaritySearch,
+)
 from synalinks.src.modules.synthesis.python_synthesis import (
     PythonSynthesis as PythonSynthesis,
 )
@@ -121,13 +361,82 @@ from synalinks.src.modules.ttc.chain_of_thought import ChainOfThought as ChainOf
 from synalinks.src.modules.ttc.self_critique import SelfCritique as SelfCritique
 from synalinks.src.ops.function import Function as Function
 from synalinks.src.ops.operation import Operation as Operation
+from synalinks.src.optimizers.omega import OMEGA as OMEGA
 from synalinks.src.programs.program import Program as Program
 from synalinks.src.programs.sequential import Sequential as Sequential
+from synalinks.src.rewards.agent_as_judge import AgentAsJudge as AgentAsJudge
+from synalinks.src.rewards.batch_reward import BatchReward as BatchReward
+from synalinks.src.rewards.composable_reward import ComposableReward as ComposableReward
 from synalinks.src.rewards.cosine_similarity import CosineSimilarity as CosineSimilarity
+from synalinks.src.rewards.deep_agent_as_judge import DeepAgentAsJudge as DeepAgentAsJudge
 from synalinks.src.rewards.exact_match import ExactMatch as ExactMatch
 from synalinks.src.rewards.lm_as_judge import LMAsJudge as LMAsJudge
 from synalinks.src.rewards.reward import Reward as Reward
 from synalinks.src.rewards.reward_wrappers import ProgramAsJudge as ProgramAsJudge
+from synalinks.src.rewards.rlm_as_judge import RLMAsJudge as RLMAsJudge
+from synalinks.src.rewards.rubric_rewards import AgentLoopDetection as AgentLoopDetection
+from synalinks.src.rewards.rubric_rewards import AnswerRelevancy as AnswerRelevancy
+from synalinks.src.rewards.rubric_rewards import (
+    ArgumentCorrectness as ArgumentCorrectness,
+)
+from synalinks.src.rewards.rubric_rewards import Bias as Bias
+from synalinks.src.rewards.rubric_rewards import (
+    CitationFaithfulness as CitationFaithfulness,
+)
+from synalinks.src.rewards.rubric_rewards import (
+    ContextualPrecision as ContextualPrecision,
+)
+from synalinks.src.rewards.rubric_rewards import ContextualRecall as ContextualRecall
+from synalinks.src.rewards.rubric_rewards import (
+    ContextualRelevancy as ContextualRelevancy,
+)
+from synalinks.src.rewards.rubric_rewards import (
+    ConversationCompleteness as ConversationCompleteness,
+)
+from synalinks.src.rewards.rubric_rewards import Faithfulness as Faithfulness
+from synalinks.src.rewards.rubric_rewards import GoalAccuracy as GoalAccuracy
+from synalinks.src.rewards.rubric_rewards import Hallucination as Hallucination
+from synalinks.src.rewards.rubric_rewards import KnowledgeRetention as KnowledgeRetention
+from synalinks.src.rewards.rubric_rewards import Misuse as Misuse
+from synalinks.src.rewards.rubric_rewards import NonAdvice as NonAdvice
+from synalinks.src.rewards.rubric_rewards import PIILeakage as PIILeakage
+from synalinks.src.rewards.rubric_rewards import PlanAdherence as PlanAdherence
+from synalinks.src.rewards.rubric_rewards import PlanQuality as PlanQuality
+from synalinks.src.rewards.rubric_rewards import PromptAlignment as PromptAlignment
+from synalinks.src.rewards.rubric_rewards import RoleAdherence as RoleAdherence
+from synalinks.src.rewards.rubric_rewards import RoleViolation as RoleViolation
+from synalinks.src.rewards.rubric_rewards import StepEfficiency as StepEfficiency
+from synalinks.src.rewards.rubric_rewards import Summarization as Summarization
+from synalinks.src.rewards.rubric_rewards import TaskCompletion as TaskCompletion
+from synalinks.src.rewards.rubric_rewards import ToolCorrectness as ToolCorrectness
+from synalinks.src.rewards.rubric_rewards import ToolPermission as ToolPermission
+from synalinks.src.rewards.rubric_rewards import ToolUse as ToolUse
+from synalinks.src.rewards.rubric_rewards import TopicAdherence as TopicAdherence
+from synalinks.src.rewards.rubric_rewards import Toxicity as Toxicity
+from synalinks.src.rewards.rubric_rewards import TurnFaithfulness as TurnFaithfulness
+from synalinks.src.rewards.rubric_rewards import TurnRelevancy as TurnRelevancy
+from synalinks.src.rewards.rubrics_as_judge import RubricsAsJudge as RubricsAsJudge
+from synalinks.src.sandboxes.mirage_sandbox import MirageSandbox as MirageSandbox
+from synalinks.src.sandboxes.sandbox import CommandExitException as CommandExitException
+from synalinks.src.sandboxes.sandbox import CommandResult as CommandResult
+from synalinks.src.sandboxes.sandbox import EntryInfo as EntryInfo
+from synalinks.src.sandboxes.sandbox import Execution as Execution
+from synalinks.src.sandboxes.sandbox import ExecutionError as ExecutionError
+from synalinks.src.sandboxes.sandbox import ExecutionResult as ExecutionResult
+from synalinks.src.sandboxes.sandbox import FileType as FileType
+from synalinks.src.sandboxes.sandbox import Logs as Logs
+from synalinks.src.sandboxes.sandbox import NotFoundException as NotFoundException
+from synalinks.src.sandboxes.sandbox import Result as Result
+from synalinks.src.sandboxes.sandbox import Sandbox as Sandbox
+from synalinks.src.sandboxes.sandbox import SandboxException as SandboxException
+from synalinks.src.sandboxes.sandbox import TimeoutException as TimeoutException
+from synalinks.src.sandboxes.sandbox import WriteInfo as WriteInfo
+from synalinks.src.saving.object_registration import (
+    register_synalinks_serializable as register_synalinks_serializable,
+)
+from synalinks.src.utils.keras_backend import (
+    disable_keras_backend as disable_keras_backend,
+)
 from synalinks.src.utils.mcp.client import MultiServerMCPClient as MultiServerMCPClient
 from synalinks.src.version import __version__
 from synalinks.src.version import version as version

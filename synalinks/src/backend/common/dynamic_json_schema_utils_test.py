@@ -1,15 +1,14 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 from enum import Enum
 from typing import List
-from typing import Literal
-from typing import Union
 
 from synalinks.src import testing
 from synalinks.src.backend import DataModel
 from synalinks.src.backend import Field
 from synalinks.src.backend import is_schema_equal
 from synalinks.src.backend.common.dynamic_json_schema_utils import dynamic_enum
+from synalinks.src.backend.common.dynamic_json_schema_utils import dynamic_enum_array
 from synalinks.src.backend.common.dynamic_json_schema_utils import dynamic_tool_calls
 from synalinks.src.backend.common.dynamic_json_schema_utils import dynamic_tool_choice
 from synalinks.src.utils.tool_utils import Tool
@@ -70,36 +69,144 @@ class DynamicEnumTest(testing.TestCase):
 
         labels = ["easy", "difficult", "unkown"]
 
-        schema = dynamic_enum(DecisionAnswer.get_schema(), "choice", labels)
+        # inline=False matches the Pydantic-generated $defs/$ref layout.
+        schema = dynamic_enum(DecisionAnswer.get_schema(), "choice", labels, inline=False)
 
         self.assertTrue(is_schema_equal(Decision.get_schema(), schema))
+
+    def test_inline_dynamic_enum(self):
+        """With inline=True, the enum is written directly into the
+        property rather than placed under $defs with a $ref."""
+
+        class DecisionAnswer(DataModel):
+            thinking: str
+            choice: str
+
+        labels = ["easy", "difficult", "unknown"]
+
+        schema = dynamic_enum(
+            DecisionAnswer.get_schema(),
+            "choice",
+            labels,
+            inline=True,
+        )
+
+        choice = schema["properties"]["choice"]
+        self.assertEqual(choice["enum"], labels)
+        self.assertEqual(choice["type"], "string")
+        # No indirection through $defs.
+        self.assertNotIn("$ref", choice)
+        self.assertNotIn("Choice", schema.get("$defs", {}))
+
+
+class DynamicEnumArrayTest(testing.TestCase):
+    """Cover the `list[Literal[...]]` patching used by `MultiDecision`."""
+
+    def test_inline_basic(self):
+        class MultiDecisionAnswer(DataModel):
+            thinking: str
+            choices: List[str] = Field(default_factory=list)
+
+        labels = ["a", "b", "c"]
+        schema = dynamic_enum_array(
+            MultiDecisionAnswer.get_schema(),
+            "choices",
+            labels,
+            inline=True,
+        )
+        choices = schema["properties"]["choices"]
+        self.assertEqual(choices["type"], "array")
+        self.assertEqual(choices["items"], {"type": "string", "enum": labels})
+        self.assertNotIn("Choices", schema.get("$defs", {}))
+
+    def test_ref_mode(self):
+        class MultiDecisionAnswer(DataModel):
+            thinking: str
+            choices: List[str] = Field(default_factory=list)
+
+        labels = ["x", "y"]
+        schema = dynamic_enum_array(
+            MultiDecisionAnswer.get_schema(),
+            "choices",
+            labels,
+            inline=False,
+        )
+        choices = schema["properties"]["choices"]
+        self.assertEqual(choices["type"], "array")
+        self.assertEqual(choices["items"], {"$ref": "#/$defs/Choices"})
+        self.assertIn("Choices", schema["$defs"])
+        self.assertEqual(schema["$defs"]["Choices"]["enum"], labels)
+
+    def test_with_description(self):
+        class MultiDecisionAnswer(DataModel):
+            thinking: str
+            choices: List[str] = Field(default_factory=list)
+
+        schema = dynamic_enum_array(
+            MultiDecisionAnswer.get_schema(),
+            "choices",
+            ["a", "b"],
+            description="Pick one or more",
+        )
+        self.assertEqual(
+            schema["properties"]["choices"]["description"], "Pick one or more"
+        )
+
+    def test_empty_labels(self):
+        class MultiDecisionAnswer(DataModel):
+            thinking: str
+            choices: List[str] = Field(default_factory=list)
+
+        schema = dynamic_enum_array(
+            MultiDecisionAnswer.get_schema(),
+            "choices",
+            [],
+        )
+        self.assertEqual(schema["properties"]["choices"]["items"]["enum"], [])
+
+    def test_property_in_defs(self):
+        """Pydantic puts nested models in `$defs`; the helper must
+        traverse them when matching the property name."""
+
+        class Inner(DataModel):
+            choices: List[str] = Field(default_factory=list)
+
+        class Outer(DataModel):
+            inner: Inner = Field(default_factory=Inner)
+
+        schema = dynamic_enum_array(
+            Outer.get_schema(),
+            "choices",
+            ["a", "b"],
+            inline=True,
+        )
+        # Property is inside $defs.Inner.properties.
+        inner_def = schema["$defs"]["Inner"]
+        self.assertEqual(
+            inner_def["properties"]["choices"]["items"],
+            {"type": "string", "enum": ["a", "b"]},
+        )
+
+    def test_not_found_raises(self):
+        class MultiDecisionAnswer(DataModel):
+            thinking: str
+            choices: List[str] = Field(default_factory=list)
+
+        with self.assertRaises(ValueError) as ctx:
+            dynamic_enum_array(
+                MultiDecisionAnswer.get_schema(),
+                "missing_field",
+                ["a", "b"],
+            )
+        self.assertIn("missing_field", str(ctx.exception))
 
 
 class DynamicToolCallsSchemaTest(testing.TestCase):
     def test_dynamic_tool_call_schema(self):
-        class Calculate(DataModel):
-            """Calculate the result of a mathematical expression."""
-
-            tool_name: Literal["calculate"]
-            expression: str = Field(
-                description=(
-                    "The mathematical expression to calculate, such as "
-                    "'2 + 2'. The expression can contain numbers, operators (+, -, *, /),"
-                    " parentheses, and spaces."
-                )
-            )
-
-        class Thinking(DataModel):
-            """Think about something."""
-
-            tool_name: Literal["thinking"]
-            thinking: str = Field(description="Your step by step thinking.")
-
-        class ToolCalls(DataModel):
-            tool_calls: List[Union[Calculate, Thinking]]
-
-        expected_schema = ToolCalls.get_schema()
-
+        """Default (inline=True) embeds per-tool sub-schemas directly in
+        `anyOf` and pins `tool_name` with both an items-level enum and a
+        per-branch const, strict enough for backends that don't honor
+        `const` inside `anyOf` (e.g. Gemini)."""
         tools = [
             Tool(calculate),
             Tool(thinking),
@@ -107,52 +214,76 @@ class DynamicToolCallsSchemaTest(testing.TestCase):
 
         dynamic_schema = dynamic_tool_calls(tools=tools)
 
-        print("Expected:")
-        print(ToolCalls.prettify_schema())
-        print("Generated:")
-        import json
+        self.assertNotIn("$defs", dynamic_schema)
+        items = dynamic_schema["properties"]["tool_calls"]["items"]
+        self.assertEqual(
+            sorted(items["properties"]["tool_name"]["enum"]),
+            ["calculate", "thinking"],
+        )
+        self.assertIn("tool_name", items["required"])
+        const_values = []
+        for branch in items["anyOf"]:
+            self.assertNotIn("$ref", branch)
+            self.assertIn("properties", branch)
+            const_values.append(branch["properties"]["tool_name"]["const"])
+        self.assertEqual(sorted(const_values), ["calculate", "thinking"])
 
-        print(json.dumps(dynamic_schema, indent=2))
+    def test_dynamic_tool_calls_schema_with_refs(self):
+        """inline=False keeps the older $defs/$ref layout for callers that
+        want to share definitions."""
+        tools = [
+            Tool(calculate),
+            Tool(thinking),
+        ]
 
-        self.assertEqual(expected_schema, dynamic_schema)
+        dynamic_schema = dynamic_tool_calls(tools=tools, inline=False)
+
+        self.assertEqual(
+            dynamic_schema["$defs"]["Calculate"]["properties"]["tool_name"]["const"],
+            "calculate",
+        )
+        items = dynamic_schema["properties"]["tool_calls"]["items"]
+        ref_targets = sorted(b["$ref"] for b in items["anyOf"])
+        self.assertEqual(
+            ref_targets,
+            ["#/$defs/Calculate", "#/$defs/Thinking"],
+        )
 
 
 class DynamicToolChoiceSchemaTest(testing.TestCase):
     def test_dynamic_tool_call_schema(self):
-        class Calculate(DataModel):
-            """Calculate the result of a mathematical expression."""
-
-            tool_name: Literal["calculate"]
-            expression: str = Field(
-                description=(
-                    "The mathematical expression to calculate, such as "
-                    "'2 + 2'. The expression can contain numbers, operators (+, -, *, /),"
-                    " parentheses, and spaces."
-                )
-            )
-
-        class Thinking(DataModel):
-            """Think about something."""
-
-            tool_name: Literal["thinking"]
-            thinking: str = Field(description="Your step by step thinking.")
-
-        class ToolChoice(DataModel):
-            tool_choice: Union[Calculate, Thinking]
-
-        expected_schema = ToolChoice.get_schema()
-
+        """Default (inline=True) embeds per-tool sub-schemas directly."""
         tools = [
             Tool(calculate),
             Tool(thinking),
         ]
 
         dynamic_schema = dynamic_tool_choice(tools=tools)
-        print("Expected:")
-        print(ToolChoice.prettify_schema())
-        print("Generated:")
-        import json
 
-        print(json.dumps(dynamic_schema, indent=2))
+        self.assertNotIn("$defs", dynamic_schema)
+        choice = dynamic_schema["properties"]["tool_choice"]
+        self.assertEqual(
+            sorted(choice["properties"]["tool_name"]["enum"]),
+            ["calculate", "thinking"],
+        )
+        self.assertIn("tool_name", choice["required"])
+        for branch in choice["anyOf"]:
+            self.assertNotIn("$ref", branch)
+            self.assertIn("properties", branch)
+            self.assertIn("tool_name", branch["properties"])
 
-        self.assertEqual(expected_schema, dynamic_schema)
+    def test_dynamic_tool_choice_schema_with_refs(self):
+        """inline=False keeps the older $defs/$ref layout."""
+        tools = [
+            Tool(calculate),
+            Tool(thinking),
+        ]
+
+        dynamic_schema = dynamic_tool_choice(tools=tools, inline=False)
+
+        choice = dynamic_schema["properties"]["tool_choice"]
+        ref_targets = sorted(b["$ref"] for b in choice["anyOf"])
+        self.assertEqual(
+            ref_targets,
+            ["#/$defs/Calculate", "#/$defs/Thinking"],
+        )

@@ -1,7 +1,9 @@
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import json
 from unittest.mock import patch
+
+import numpy as np
 
 from synalinks.src import metrics
 from synalinks.src import modules
@@ -10,7 +12,7 @@ from synalinks.src import programs
 from synalinks.src import rewards
 from synalinks.src import testing
 from synalinks.src.backend import JsonDataModel
-from synalinks.src.language_models import LanguageModel
+from synalinks.src.modules.language_models import LanguageModel
 from synalinks.src.testing.test_utils import AnswerWithRationale
 from synalinks.src.testing.test_utils import Query
 from synalinks.src.testing.test_utils import load_test_data
@@ -146,6 +148,85 @@ class TestTrainer(testing.TestCase):
         )
 
     @patch("litellm.acompletion")
+    async def test_evaluate_predicts_each_sample_once_when_unbuilt(self, mock_completion):
+        """An unbuilt program must not be run twice on the batch it builds on.
+
+        Building a program means calling it, and `evaluate` builds on the first
+        batch — which is also the first batch it scores. Dropping that build's
+        predictions and recomputing them costs a second full forward pass per
+        sample in the batch, which for an agent program is a second agent run:
+        every LM call and every tool call paid twice, for a result thrown away.
+
+        The program here keeps a module its `call()` never reaches, which is
+        what makes this permanent rather than a one-off. `built` is only set by
+        calling a module, so a module on an untaken path never becomes built,
+        `all(module.built ...)` never becomes true, and *every* `evaluate` pays
+        the extra pass. Agents are full of such modules — a fallback generator
+        that only runs when the loop ends without submitting, a tool the model
+        happens not to call.
+        """
+        mock_answer = AnswerWithRationale(
+            rationale="""The capital of France is well-known and is the seat of """
+            """the French government.""",
+            answer="Paris",
+        )
+
+        mock_completion.return_value = {
+            "choices": [{"message": {"content": json.dumps(mock_answer.get_json())}}]
+        }
+
+        language_model = LanguageModel(model="ollama/mistral")
+
+        class ProgramWithAnUntakenPath(programs.Program):
+            forward_passes = 0
+
+            def __init__(self, language_model=None):
+                super().__init__()
+                self.answer = modules.Generator(
+                    data_model=AnswerWithRationale,
+                    language_model=language_model,
+                )
+                self.fallback = modules.Generator(
+                    data_model=AnswerWithRationale,
+                    language_model=language_model,
+                )
+
+            async def call(self, inputs, training=False):
+                type(self).forward_passes += 1
+                return await self.answer(inputs)
+
+        program = ProgramWithAnUntakenPath(language_model=language_model)
+
+        program.compile(
+            optimizer=optimizers.random_few_shot.RandomFewShot(),
+            reward=rewards.ExactMatch(in_mask=["answer"]),
+            metrics=[
+                metrics.MeanMetricWrapper(rewards.exact_match, in_mask=["answer"]),
+            ],
+        )
+
+        (_, _), (x_test, y_test) = load_test_data()
+
+        self.assertFalse(all(module.built for module in program._flatten_modules()))
+
+        _ = await program.evaluate(x=x_test, y=y_test)
+
+        # The build pass predicted the whole first batch, and those predictions
+        # are what the first `test_on_batch` scores — so each sample is
+        # predicted once, not twice. The one extra pass is `_auto_build`'s own
+        # spec pass for the metric and reward state; it is paid once per
+        # program, not once per sample, and is not what this reuse addresses.
+        self.assertLessEqual(ProgramWithAnUntakenPath.forward_passes, len(x_test) + 1)
+
+        # `fallback` is still unbuilt, so the next `evaluate` auto-builds again
+        # — and must again cost exactly one pass per sample. This is what makes
+        # the duplication permanent rather than a first-call toll.
+        before = ProgramWithAnUntakenPath.forward_passes
+        _ = await program.evaluate(x=x_test, y=y_test)
+        self.assertFalse(all(module.built for module in program._flatten_modules()))
+        self.assertEqual(ProgramWithAnUntakenPath.forward_passes - before, len(x_test))
+
+    @patch("litellm.acompletion")
     async def test_predict(self, mock_completion):
         mock_answer = AnswerWithRationale(
             rationale="""The capital of France is well-known and is the seat of """
@@ -174,3 +255,241 @@ class TestTrainer(testing.TestCase):
         self.assertEqual(len(y_data), len(x_train))
         self.assertIsInstance(y_data[0], JsonDataModel)
         self.assertIsInstance(y_data[1], JsonDataModel)
+
+
+class TestCompiledMetricIsolation(testing.TestCase):
+    """`compile()` takes ownership of its metrics: each program gets its OWN
+    metric instances, so sharing one metrics list across the per-model
+    programs of a sweep never lets state leak between programs. Covers both
+    operational metrics (which bind to a program's LanguageModel and would
+    otherwise all end up bound to the last program compiled) and ordinary
+    metrics (whose accumulated state would otherwise carry across programs).
+    """
+
+    async def _program(self, model):
+        x0 = modules.Input(data_model=Query)
+        x1 = await modules.Generator(
+            data_model=AnswerWithRationale,
+            language_model=LanguageModel(model=model),
+        )(x0)
+        return programs.Program(inputs=x0, outputs=x1)
+
+    def _bound_op_metric(self, program):
+        """The operational metric `compile()` bound to this program."""
+        from synalinks.src import tree
+
+        for m in tree.flatten(program._compile_metrics._user_metrics):
+            if hasattr(m, "bind_program"):
+                return m
+        raise AssertionError("no bound operational metric found")
+
+    async def test_shared_operational_metric_binds_per_program(self):
+        from synalinks.src.metrics.lm_metrics import Cost
+        from synalinks.src.metrics.lm_metrics import _collect_language_models
+
+        model_names = ["ollama/model-a", "ollama/model-b", "ollama/model-c"]
+        costs = [0.01, 0.02, 0.03]
+
+        # ONE metric instance reused across every program in the sweep.
+        shared = Cost()
+        progs = []
+        for name in model_names:
+            program = await self._program(name)
+            program.compile(reward=rewards.ExactMatch(), metrics=[shared])
+            progs.append(program)
+
+        # Each model runs and accumulates its OWN provider cost.
+        for program, cost in zip(progs, costs):
+            _collect_language_models(program)[0].inference_cumulated_cost += cost
+
+        bound = [self._bound_op_metric(p) for p in progs]
+
+        # Each program must own a distinct bound metric...
+        self.assertEqual(len({id(m) for m in bound}), len(progs))
+        # ...reading only its own model's counters.
+        for program, metric, cost in zip(progs, bound, costs):
+            self.assertEqual(
+                _collect_language_models(program),
+                metric.language_models,
+            )
+            self.assertAlmostEqual(metric.result(), cost)
+
+    async def test_compile_clones_metrics_so_programs_never_share(self):
+        """A metric instance passed to `compile()` is cloned, not adopted:
+        the caller's instance is never wired into any program, and each
+        program owns a distinct clone -- for both ordinary and operational
+        metrics."""
+        from synalinks.src import metrics as metrics_module
+        from synalinks.src import tree
+        from synalinks.src.metrics.lm_metrics import Cost
+
+        async def custom_metric(y_true, y_pred):
+            return 0.0
+
+        shared_ordinary = metrics_module.MeanMetricWrapper(custom_metric, name="custom")
+        shared_ops = Cost()
+
+        progs = []
+        for name in ["ollama/model-a", "ollama/model-b"]:
+            program = await self._program(name)
+            program.compile(
+                reward=rewards.ExactMatch(),
+                metrics=[shared_ordinary, shared_ops],
+            )
+            progs.append(program)
+
+        def owned(program):
+            return list(tree.flatten(program._compile_metrics._user_metrics))
+
+        for program in progs:
+            instances = owned(program)
+            # The caller's instances were cloned away, never adopted.
+            self.assertNotIn(shared_ordinary, instances)
+            self.assertNotIn(shared_ops, instances)
+            # Clones keep the type, name, and (for the wrapper) the fn BY
+            # REFERENCE -- the wrapped callable is shared, never deep-copied.
+            by_name = {m.name: m for m in instances}
+            self.assertIsInstance(by_name["custom"], metrics_module.MeanMetricWrapper)
+            self.assertIs(by_name["custom"]._fn, custom_metric)
+
+        # The two programs own distinct clones (nothing shared between them).
+        a = {m.name: id(m) for m in owned(progs[0])}
+        b = {m.name: id(m) for m in owned(progs[1])}
+        for name in ("custom", "cost"):
+            self.assertNotEqual(a[name], b[name])
+
+        # The caller's shared instances stay pristine (never bound / built).
+        self.assertEqual(shared_ops.language_models, [])
+
+
+class TestCompileStringIdentifiers(testing.TestCase):
+    """Keras-style: pass lowercase strings to `compile(...)` instead of
+    instances. Lookup is case-insensitive: CamelCase still works but
+    lowercase is the idiomatic form."""
+
+    def _make_program(self):
+        return ExampleProgram(
+            data_model=Query,
+            language_model=LanguageModel(model="ollama/mistral"),
+        )
+
+    def test_optimizer_string(self):
+        program = self._make_program()
+        program.compile(optimizer="randomfewshot", reward=rewards.ExactMatch())
+        self.assertIsInstance(program.optimizer, optimizers.RandomFewShot)
+
+    def test_optimizer_string_camelcase_also_works(self):
+        program = self._make_program()
+        program.compile(optimizer="RandomFewShot", reward=rewards.ExactMatch())
+        self.assertIsInstance(program.optimizer, optimizers.RandomFewShot)
+
+    def test_reward_string(self):
+        program = self._make_program()
+        program.compile(optimizer="randomfewshot", reward="exactmatch")
+        self.assertIsInstance(program.reward, rewards.ExactMatch)
+
+    def test_reward_string_camelcase_also_works(self):
+        program = self._make_program()
+        program.compile(optimizer="randomfewshot", reward="ExactMatch")
+        self.assertIsInstance(program.reward, rewards.ExactMatch)
+
+    def test_metrics_strings(self):
+        program = self._make_program()
+        program.compile(
+            optimizer="randomfewshot",
+            reward="exactmatch",
+            metrics=["mean"],
+        )
+        # Metrics get wrapped in CompileMetrics; the underlying instance is
+        # constructed via metrics.get(...).
+        self.assertIsNotNone(program._compile_metrics)
+
+    def test_full_keras_style_compile(self):
+        program = self._make_program()
+        program.compile(
+            optimizer="randomfewshot",
+            reward="exactmatch",
+            metrics=["mean"],
+        )
+        self.assertIsInstance(program.optimizer, optimizers.RandomFewShot)
+        self.assertIsInstance(program.reward, rewards.ExactMatch)
+        self.assertTrue(program.compiled)
+
+    def test_unknown_optimizer_string_raises(self):
+        program = self._make_program()
+        with self.assertRaises(ValueError):
+            program.compile(
+                optimizer="notarealoptimizer",
+                reward=rewards.ExactMatch(),
+            )
+
+    def test_unknown_reward_string_raises(self):
+        program = self._make_program()
+        with self.assertRaises(ValueError):
+            program.compile(
+                optimizer="randomfewshot",
+                reward="notarealreward",
+            )
+
+    def test_instance_pass_through_unchanged(self):
+        program = self._make_program()
+        opt = optimizers.RandomFewShot()
+        rew = rewards.ExactMatch()
+        program.compile(optimizer=opt, reward=rew)
+        # Instances should be stored as-is (no re-instantiation).
+        self.assertIs(program.optimizer, opt)
+        self.assertIs(program.reward, rew)
+
+    def test_dict_config_optimizer(self):
+        program = self._make_program()
+        program.compile(
+            optimizer={"class_name": "randomfewshot", "config": {}},
+            reward=rewards.ExactMatch(),
+        )
+        self.assertIsInstance(program.optimizer, optimizers.RandomFewShot)
+
+
+class StratifiedMinibatchTest(testing.TestCase):
+    def _targets(self, labels):
+        return np.array(
+            [
+                JsonDataModel(json={"reward": r}, schema={"type": "object"})
+                for r in labels
+            ],
+            dtype="object",
+        )
+
+    def test_minibatch_spans_the_target_classes(self):
+        from synalinks.src.trainers.trainer import stratified_minibatch_indices
+
+        y = self._targets([0.0] * 10 + [0.5] * 10 + [1.0] * 10)
+        rng = np.random.default_rng(0)
+        for _ in range(20):
+            idx = stratified_minibatch_indices(y, 3, rng=rng)
+            self.assertEqual(len(idx), 3)
+            self.assertEqual(len(set(idx.tolist())), 3)
+            self.assertEqual(sorted(y[i].get("reward") for i in idx), [0.0, 0.5, 1.0])
+
+    def test_round_robin_when_size_exceeds_number_of_classes(self):
+        from synalinks.src.trainers.trainer import stratified_minibatch_indices
+
+        y = self._targets([0.0] * 10 + [1.0] * 10)
+        idx = stratified_minibatch_indices(y, 4, rng=np.random.default_rng(1))
+        labels = sorted(y[i].get("reward") for i in idx)
+        self.assertEqual(labels, [0.0, 0.0, 1.0, 1.0])
+        self.assertEqual(len(set(idx.tolist())), 4)
+
+    def test_falls_back_to_random_when_targets_do_not_repeat(self):
+        from synalinks.src.trainers.trainer import stratified_minibatch_indices
+
+        y = self._targets([i / 100 for i in range(30)])
+        idx = stratified_minibatch_indices(y, 4, rng=np.random.default_rng(2))
+        self.assertEqual(len(idx), 4)
+        self.assertEqual(len(set(idx.tolist())), 4)
+
+    def test_size_is_capped_at_population(self):
+        from synalinks.src.trainers.trainer import stratified_minibatch_indices
+
+        y = self._targets([0.0, 1.0, 0.0])
+        idx = stratified_minibatch_indices(y, 10, rng=np.random.default_rng(3))
+        self.assertEqual(sorted(idx.tolist()), [0, 1, 2])

@@ -49,7 +49,9 @@ async def calculate(expression: str):
     Args:
         expression (str): The mathematical expression to calculate.
     \"\"\"
-    result = eval(expression)
+    if not all(char in "0123456789+-*/(). " for char in expression):
+        return {"result": None, "log": "Error: invalid characters in expression"}
+    result = eval(expression, {"__builtins__": None}, {})
     return {"result": result, "log": "Successfully executed"}
 
 tools = [synalinks.Tool(calculate)]
@@ -162,14 +164,14 @@ async def main():
     load_dotenv()
 
     # Enable observability for tracing
-    synalinks.enable_observability(
-        tracking_uri="http://localhost:5000",
-        experiment_name="autonomous_math_agent",
-    )
+#     synalinks.enable_observability(
+#         tracking_uri="http://localhost:5000",
+#         experiment_name="autonomous_math_agent",
+#     )
 
     # Initialize the language model
     language_model = synalinks.LanguageModel(
-        model="gemini/gemini-2.0-flash",
+        model="ollama/qwen3:8b",
     )
 
     # Define the tools available to the agent

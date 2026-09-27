@@ -8,3 +8,5 @@ from synalinks.src.hooks.hook import Hook as Hook
 from synalinks.src.hooks.hook_list import HookList as HookList
 from synalinks.src.hooks.logger import Logger as Logger
 from synalinks.src.hooks.monitor import Monitor as Monitor
+from synalinks.src.hooks.monitor import trace_context as trace_context
+from synalinks.src.hooks.recorder import Recorder as Recorder

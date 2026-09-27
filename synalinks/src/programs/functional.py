@@ -1,6 +1,6 @@
 # Modified from: keras/src/models/functional.py
 # Original authors: François Chollet et al. (Keras Team)
-# License Apache 2.0: (c) 2025 Yoan Sallami (Synalinks Team)
+# License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import copy
 import inspect
@@ -151,7 +151,7 @@ class Functional(Function, Program):
                 tree.lists_to_tuples(inputs),
                 tree.lists_to_tuples(self._inputs_struct),
             )
-        except:
+        except Exception:
             model_inputs_struct = tree.map_structure(
                 lambda x: x.name, self._inputs_struct
             )

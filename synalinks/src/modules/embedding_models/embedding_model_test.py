@@ -5,7 +5,6 @@ from unittest.mock import patch
 from unittest.mock import sentinel
 
 import litellm
-
 from litellm.types.utils import Embedding
 from litellm.types.utils import EmbeddingResponse
 from litellm.types.utils import PromptTokensDetailsWrapper
